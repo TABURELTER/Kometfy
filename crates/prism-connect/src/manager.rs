@@ -514,8 +514,15 @@ impl Manager {
 
     // ---------------------------------------------------------------- helpers
 
+    /// The settings as they apply now. Without a VPN key only the free tools exist, whatever mode is stored (the
+    /// Home shows the same): a fresh install, whose stored mode is smart, would otherwise keep the bypass paused
+    /// "while the VPN is on" with no VPN at all. The stored choice applies again once a key is added.
     fn settings(&self) -> Settings {
-        self.settings.read().unwrap().clone()
+        let mut s = self.settings.read().unwrap().clone();
+        if self.profiles.lock().unwrap().items().is_empty() {
+            s.app_mode = crate::settings::AppMode::FreeAntiDpi;
+        }
+        s
     }
 
     pub fn metrics(&self) -> &Metrics {
@@ -3939,6 +3946,21 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         let manager = Manager::new(dir.clone(), Arc::new(|_, _| {})).unwrap();
         (manager, dir)
+    }
+
+    /// A fresh install stores the smart mode, but with no key the free tools are all there is: the bypass must
+    /// not wait "while the VPN is on". The first key brings the stored mode back.
+    #[tokio::test]
+    async fn no_key_means_the_free_mode() {
+        use crate::settings::AppMode;
+        let dir = std::env::temp_dir().join(format!("kometfy-mode-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let m = Manager::new(dir.clone(), Arc::new(|_, _| {})).unwrap();
+        assert_eq!(m.settings.read().unwrap().app_mode, AppMode::SmartHybridVpn);
+        assert_eq!(m.settings().app_mode, AppMode::FreeAntiDpi);
+        m.import_profile("vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls&type=tcp#t", None).await.unwrap();
+        assert_eq!(m.settings().app_mode, AppMode::SmartHybridVpn);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[cfg(target_os = "macos")]
