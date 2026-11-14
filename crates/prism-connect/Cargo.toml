@@ -1,0 +1,70 @@
+[package]
+name = "prism-connect"
+version.workspace = true
+edition.workspace = true
+license = "GPL-3.0-only"
+publish = false
+description = "Kometfy's network core: profiles, share links, chain proxies, TUN, system proxy, DPI bypass, the Telegram bridge"
+repository = "https://github.com/TABURELTER/Kometfy"
+
+[features]
+macos-native-bridge = []
+macos-native-installer = []
+macos-proxy-integration-preview = ["macos-native-bridge"]
+macos-tun-integration = ["macos-native-bridge"]
+# Fake-only orchestration until the installed guard's fork/exec race is solved.
+macos-tun-lab = []
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+tokio = { workspace = true }
+reqwest = { workspace = true, features = ["json", "gzip", "stream", "socks"] }
+futures-util = "0.3"
+base64 = "0.22"
+url = "2"
+percent-encoding = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+sha2 = "0.10"
+rsa = "0.9"
+if-addrs = "0.15"
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# Telegram bridge (`tgbridge`): obfuscated2 re-encryption and the WebSocket to Telegram's gateways
+aes = "0.8"
+ctr = "0.9"
+getrandom = "0.2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1"
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+plist = "1.10"
+flate2 = "1"
+
+[dev-dependencies]
+plist = "1.10"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+winreg = { workspace = true }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Networking_WinInet",
+    "Win32_Networking_WinSock",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+] }

@@ -1,0 +1,29 @@
+name: Идея · Feature request
+description: Чего не хватает. What is missing.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: Какую задачу вы решаете · What are you trying to do
+      description: "Опишите задачу, а не решение: так проще найти лучший вариант. Describe the goal, not the solution."
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Как это могло бы работать · How it could work
+  - type: textarea
+    id: other
+    attributes:
+      label: Как вы решаете это сейчас · What you do today
+      description: Другая программа, обходной путь. Another app or a workaround.
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Для какой платформы · Platform
+      options:
+        - Windows
+        - macOS
+        - Android
+        - Любая · Any

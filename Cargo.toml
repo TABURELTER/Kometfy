@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = ["crates/prism-connect"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+authors = ["Dmitriy (TABURELTER)"]
+license = "GPL-3.0-only"
+repository = "https://github.com/TABURELTER/Kometfy"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2.0"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+uuid = { version = "1.10", features = ["v4", "serde"] }
+winreg = "0.52"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "unwind"

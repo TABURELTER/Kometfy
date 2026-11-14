@@ -1,0 +1,82 @@
+name: Ошибка · Bug report
+description: Что-то работает не так. Something does not work.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Спасибо! Чем точнее описание, тем быстрее найдётся причина. Thanks! The more precise the report, the faster the cause is found.
+
+        **Не публикуйте ссылки на подписки, ключи и адреса серверов.** Do not post subscription links, keys or server addresses.
+  - type: input
+    id: version
+    attributes:
+      label: Версия PrismRoute · Version
+      description: Настройки → Обновления (например, 0.2.5); на Android — Настройки → Ядро. Settings → Updates; on Android Settings → Core.
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Система · System
+      options:
+        - Windows 11
+        - Windows 10
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Android (телефон · phone)
+        - Android (планшет · tablet)
+        - Другая · Other
+    validations:
+      required: true
+  - type: dropdown
+    id: method
+    attributes:
+      label: Способ перехвата · Capture method
+      options:
+        - Системный прокси · System proxy
+        - TUN
+        - VPN на Android · Android VPN
+        - Не дошло до подключения · Never got to connect
+    validations:
+      required: true
+  - type: dropdown
+    id: xray
+    attributes:
+      label: Ядро Xray · Xray core
+      options:
+        - Выключено · Off
+        - Только когда нужно · Only when needed
+        - Все поддерживаемые серверы · All supported servers
+        - Не знаю · Not sure
+  - type: textarea
+    id: what
+    attributes:
+      label: Что произошло · What happened
+      description: И что вы ожидали увидеть. And what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Как повторить · Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+  - type: textarea
+    id: report
+    attributes:
+      label: Диагностический отчёт · Diagnostic report
+      description: |
+        Настройки → Диагностика → «Сохранить диагностический отчёт» → «Копировать» (на Android можно «Поделиться»). Settings → Diagnostics → Save diagnostic report → Copy (on Android also Share).
+        Из отчёта вырезаны адреса, названия сайтов и серверов, ссылки и ключи, но очистка работает по шаблонам: прочитайте его перед отправкой. Addresses, site and server names, links and keys are cut out by patterns: read it before you post it.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Перед отправкой · Before you send
+      options:
+        - label: Я прочитал отчёт и в нём нет ничего личного · I read the report and it holds nothing private
+        - label: В описании нет ссылок на подписки и ключей · The description has no subscription links or keys
+          required: true
