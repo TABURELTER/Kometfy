@@ -357,6 +357,11 @@ fn vpn_on(s: &Settings) -> bool {
     s.connected && s.app_mode != crate::settings::AppMode::FreeAntiDpi
 }
 
+/// May the free tools run now: always beside a VPN mode, and in the free mode while its main switch is on.
+fn tools_allowed(s: &Settings) -> bool {
+    s.app_mode != crate::settings::AppMode::FreeAntiDpi || s.free_on
+}
+
 /// Not Android: there the app is outside its own tunnel, so its own connections always leave directly.
 fn android_less() -> bool {
     !cfg!(target_os = "android")
@@ -942,7 +947,11 @@ impl Manager {
                     running: self.zapret.pid().is_some(),
                     paused: settings.zapret.enabled && vpn_on(&settings) && self.zapret.pid().is_none(),
                     // the one that runs: a name this platform lacks (Windows' "general" on a fresh phone) runs the first
-                    strategy: self.zapret_strategy(&settings.zapret.strategy).map(|x| x.name).unwrap_or_else(|_| settings.zapret.strategy.clone()),
+                    strategy: if settings.zapret.strategy.is_empty() {
+                        String::new()
+                    } else {
+                        self.zapret_strategy(&settings.zapret.strategy).map(|x| x.name).unwrap_or_else(|_| settings.zapret.strategy.clone())
+                    },
                     error: self.zapret_error.lock().unwrap().clone(),
                     finding: self.zapret_find.lock().unwrap().clone(),
                 }
@@ -1059,7 +1068,7 @@ impl Manager {
             return;
         }
         let s = self.settings();
-        if s.tg.enabled {
+        if s.tg.enabled && tools_allowed(&s) {
             if let Err(e) = self.start_tg().await {
                 warn!("telegram bridge: {e}");
             }
@@ -1226,6 +1235,14 @@ impl Manager {
                 .collect();
             (subs.len(), names)
         };
+        // the system, the memory and the load beyond the old P95s were added to the statistics' description in the
+        // consent's revision 3: an install that agreed to an older text sends them only once it has seen the new one
+        let described = s.consent_rev >= 3;
+        let device = json!({
+            "os_version": crate::device::info().os_version,
+            "ram_gb": crate::device::ram_gb(),
+            "cores": std::thread::available_parallelism().map_or(1, |n| n.get()),
+        });
         [crate::remote::yesterday(), crate::remote::today()]
             .into_iter()
             .filter_map(|day| {
@@ -1249,6 +1266,13 @@ impl Manager {
                     },
                     "cpu_p95": d.cpu_p95,
                     "mem_p95": d.mem_p95,
+                    "cpu_p50": if described { json!(d.cpu_p50) } else { Value::Null },
+                    "mem_p50": if described { json!(d.mem_p50) } else { Value::Null },
+                    "core_mem_p95": if described { json!(d.core_mem_p95) } else { Value::Null },
+                    "start_ms": if described { json!(d.start_ms) } else { Value::Null },
+                    // what the app runs on, to see how heavy it is there: the system's version, memory as a size
+                    // class and processor cores; never the model or anything that names the device
+                    "device": if described { device.clone() } else { Value::Null },
                     "net": if s.consent_network { net.clone() } else { Value::Null },
                     "subs": if s.consent_subs { json!({ "count": count, "names": names }) } else { Value::Null },
                 }))
@@ -1966,6 +1990,47 @@ impl Manager {
         r
     }
 
+    /// The free mode's big button. On: the tools the user chose start, the Telegram bridge first (so it is on and
+    /// remembered if the DPI engine then needs administrator rights), then the DPI engine, then the core when its
+    /// filters or, off Windows, the engine need it. Off: all of them stop, and the choices stay as they were, so the
+    /// next press brings back exactly what was chosen.
+    pub async fn set_free(self: &Arc<Self>, on: bool) -> Result<()> {
+        {
+            let mut s = self.settings.write().unwrap();
+            s.free_on = on;
+            if s.tg.secret.is_empty() {
+                s.tg.secret = crate::tgbridge::new_secret();
+            }
+        }
+        self.save_settings()?;
+        let s = self.settings();
+        if !on {
+            self.tg.lock().unwrap().take();
+            *self.tg_error.lock().unwrap() = None;
+            self.zapret.stop();
+            let r = if s.connected { self.disconnect().await } else { Ok(()) };
+            self.emit_state();
+            return r;
+        }
+        if s.tg.enabled {
+            if let Err(e) = self.start_tg().await {
+                warn!("telegram bridge: {e}");
+            }
+        }
+        let dpi = s.zapret.enabled && self.dpi_installed();
+        let engine = if dpi { self.set_dpi(true).await } else { Ok(()) };
+        // administrator rights: the app restarts elevated and its start brings the rest up
+        if matches!(engine, Err(Error::NeedAdmin)) {
+            self.emit_state();
+            return engine;
+        }
+        // a strategy that failed still leaves the filters (ads, AI, games) to run
+        let need_core = s.adblock || s.ai_access || s.games_dns || (dpi && engine.is_ok() && !cfg!(windows));
+        let core = if need_core && !self.settings().connected { self.connect().await } else { Ok(()) };
+        self.emit_state();
+        engine.and(core)
+    }
+
     /// The auto-search, then the core's route to the engine that won.
     pub async fn find_dpi(self: &Arc<Self>) -> Result<String> {
         let before = self.zapret.pid().is_some();
@@ -2660,7 +2725,10 @@ impl Manager {
             return Err(e);
         }
         info!("telegram bridge {}: saved to {}", if on { "on" } else { "off" }, self.paths.settings_file().display());
-        let r = if on {
+        // chosen while the free mode's main switch is off: it starts with the switch
+        let r = if on && !tools_allowed(&self.settings()) {
+            Ok(())
+        } else if on {
             self.start_tg().await
         } else {
             self.tg.lock().unwrap().take();
@@ -2821,9 +2889,13 @@ impl Manager {
         if self.zapret_find.lock().unwrap().is_some() {
             return Err(Error::msg("a strategy is being chosen right now"));
         }
-        let r = if on && vpn_on(&self.settings()) {
-            // Zapret waits while the VPN is on (see pause_zapret) and starts when it goes off
+        let r = if on && (vpn_on(&self.settings()) || !tools_allowed(&self.settings())) {
+            // Zapret waits while the VPN is on (see pause_zapret) and starts when it goes off, and in the free mode
+            // it waits for the main switch
             Ok(())
+        } else if on && self.settings().zapret.strategy.is_empty() {
+            // never chosen: try them now and keep the one that gets YouTube's video and Discord through
+            self.zapret_find().await.map(|_| ())
         } else if on {
             let name = self.settings().zapret.strategy;
             match self.zapret_strategy(&name) {
@@ -2857,6 +2929,7 @@ impl Manager {
         let s = self.settings();
         if s.zapret.enabled
             && !vpn_on(&s)
+            && tools_allowed(&s)
             && self.zapret.pid().is_none()
             && (!cfg!(windows) || elevate::is_elevated())
             && self.dpi_installed()
@@ -3939,12 +4012,44 @@ mod tests {
         let port = probe.local_addr().unwrap().port();
         drop(probe);
         manager.settings.write().unwrap().tg.port = port;
+        // the free mode's main switch on, so the bridge starts as soon as it is chosen
+        manager.settings.write().unwrap().free_on = true;
         manager.set_tg_bridge(true).await.unwrap();
         let saved = Settings::load(&dir.join("settings.json"));
         assert!(saved.tg.enabled && saved.tg.secret.len() == 32, "{:?}", saved.tg);
         assert!(manager.state().tg.running);
         manager.set_tg_bridge(false).await.unwrap();
         assert!(!Settings::load(&dir.join("settings.json")).tg.enabled);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The big button of the free mode runs what the Tools page chose and never changes those choices: switched off
+    /// and on again it brings back exactly the same tools, and a tool chosen while it is off waits for it.
+    #[tokio::test]
+    async fn the_free_switch_keeps_the_users_choices() {
+        let dir = std::env::temp_dir().join(format!("kometfy-free-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let m = Manager::new(dir.clone(), Arc::new(|_, _| {})).unwrap();
+        {
+            let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let mut s = m.settings.write().unwrap();
+            s.tg.port = probe.local_addr().unwrap().port();
+            // only the bridge: the filters would need a core, which tests do not have
+            (s.adblock, s.ai_access, s.games_dns, s.zapret.enabled) = (false, false, false, false);
+        }
+        // a fresh install: the bridge is chosen, but nothing runs before the press
+        assert!(!m.settings().free_on && m.settings().tg.enabled && m.settings().zapret.strategy.is_empty());
+        m.set_tg_bridge(true).await.unwrap();
+        assert!(!m.state().tg.running, "chosen while the switch is off: it waits");
+        m.set_free(true).await.unwrap();
+        assert!(m.state().tg.running);
+        m.set_free(false).await.unwrap();
+        assert!(!m.state().tg.running);
+        assert!(m.settings().tg.enabled, "the button must not undo the choice");
+        m.set_tg_bridge(false).await.unwrap();
+        m.set_free(true).await.unwrap();
+        assert!(!m.state().tg.running, "switched off on the Tools page: the button must not bring it back");
+        m.set_free(false).await.unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
 

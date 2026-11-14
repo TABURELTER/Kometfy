@@ -22,6 +22,40 @@ pub struct Device {
     pub model: String,
 }
 
+/// The device's memory in whole gigabytes, rounded (a size class, not the exact amount), or None when unknown.
+pub fn ram_gb() -> Option<u32> {
+    total_ram().map(|bytes| ((bytes as f64) / 1_073_741_824.0).round().max(1.0) as u32)
+}
+
+#[cfg(windows)]
+fn total_ram() -> Option<u64> {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetPerformanceInfo, PERFORMANCE_INFORMATION};
+    let mut p: PERFORMANCE_INFORMATION = unsafe { std::mem::zeroed() };
+    let cb = std::mem::size_of::<PERFORMANCE_INFORMATION>() as u32;
+    p.cb = cb;
+    (unsafe { K32GetPerformanceInfo(&mut p, cb) } != 0).then(|| p.PhysicalTotal as u64 * p.PageSize as u64)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn total_ram() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kb: u64 = text.lines().find_map(|l| l.strip_prefix("MemTotal:"))?.trim().trim_end_matches("kB").trim().parse().ok()?;
+    Some(kb * 1024)
+}
+
+#[cfg(target_os = "macos")]
+fn total_ram() -> Option<u64> {
+    let mut bytes: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    let ok = unsafe { libc::sysctlbyname(c"hw.memsize".as_ptr(), &mut bytes as *mut u64 as *mut libc::c_void, &mut len, std::ptr::null_mut(), 0) } == 0;
+    ok.then_some(bytes)
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "android", target_os = "macos")))]
+fn total_ram() -> Option<u64> {
+    None
+}
+
 #[cfg(windows)]
 fn reg_string(path: &str, name: &str) -> Option<String> {
     RegKey::predef(HKEY_LOCAL_MACHINE)
@@ -210,6 +244,14 @@ pub fn system_langs() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    /// The memory size class is read on the platforms the app ships for, and it is a plausible number of gigabytes.
+    #[test]
+    #[cfg(any(windows, target_os = "linux", target_os = "android", target_os = "macos"))]
+    fn memory_is_a_size_class() {
+        let gb = super::ram_gb().expect("the system tells its memory");
+        assert!((1..=1024).contains(&gb), "{gb} GB");
+    }
+
     use super::*;
 
     #[test]
@@ -236,3 +278,4 @@ mod tests {
         assert!(d.os_version.starts_with("10."));
     }
 }
+

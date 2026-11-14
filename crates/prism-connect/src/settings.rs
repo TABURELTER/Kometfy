@@ -208,7 +208,9 @@ impl Default for ZapretSettings {
     fn default() -> Self {
         // sites that often do not open in Russia, as in ByeByeDPI's own list; the user edits them
         let domains = ["facebook.com", "instagram.com", "t.me", "telegram.org", "whatsapp.com", "whatsapp.net"].map(String::from).to_vec();
-        Self { enabled: false, strategy: "general".into(), domains, game_filter: false }
+        // chosen on a fresh install like the bridge; it runs once installed and the free mode is switched on
+        // no strategy yet: the first start picks one by trying them (`Manager::set_zapret`)
+        Self { enabled: true, strategy: String::new(), domains, game_filter: false }
     }
 }
 
@@ -225,9 +227,14 @@ pub struct TgSettings {
     pub cf_domains: Vec<String>,
 }
 
+fn on() -> bool {
+    true
+}
+
 impl Default for TgSettings {
     fn default() -> Self {
-        Self { enabled: false, port: 1443, secret: String::new(), cf_domains: Vec::new() }
+        // chosen on a fresh install, so the free mode's first press has something to start; it starts only with the press
+        Self { enabled: true, port: 1443, secret: String::new(), cf_domains: Vec::new() }
     }
 }
 
@@ -245,6 +252,11 @@ pub struct Settings {
     pub method: Method,
     /// User intent: traffic capture (system proxy / TUN) is on.
     pub connected: bool,
+    /// The free mode's main switch (the big button): the free tools the user chose (`tg.enabled`, `zapret.enabled`,
+    /// the core's filters) run only while it is on, and the button never changes those choices. Off on a fresh
+    /// install; on in a settings file from before it, so those installs keep running what they ran.
+    #[serde(default = "on")]
+    pub free_on: bool,
     pub auto_connect: bool,
     pub auto_start_core: bool,
     pub unified_delay: bool,
@@ -320,6 +332,7 @@ impl Default for Settings {
             log_level: "info".into(),
             method: Method::SystemProxy,
             connected: false,
+            free_on: false,
             auto_connect: false,
             auto_start_core: true,
             unified_delay: true,
@@ -417,7 +430,10 @@ mod tests {
         assert_eq!(s.mixed_port, 1234);
         assert_eq!(s.xray.mode, XrayMode::Auto);
         assert!(!s.dpi.enabled && s.dpi.follow_subscription && s.hwid);
-        assert_eq!((s.app_mode, s.tg.port, s.tg.enabled), (AppMode::SmartHybridVpn, 1443, false));
+        assert_eq!((s.app_mode, s.tg.port), (AppMode::SmartHybridVpn, 1443));
+        // a settings file from before the free mode's main switch keeps running what it ran
+        assert!(s.free_on);
+        assert!(!Settings::default().free_on, "a fresh install starts nothing before the first press");
         let s: Settings = serde_json::from_str(r#"{"app_mode": "FreeAntiDPI"}"#).unwrap();
         assert_eq!(s.app_mode, AppMode::FreeAntiDpi);
     }

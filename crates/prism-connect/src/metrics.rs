@@ -398,11 +398,16 @@ impl Metrics {
     pub fn day_totals(&self, date: &str) -> Option<DayTotals> {
         let s = self.store.lock().unwrap();
         let d = s.days.get(date)?;
-        let p95 = |name: &str| d.hists.get(name).filter(|h| h.n > 0).map(|h| h.quantile(bounds(name), 0.95));
+        let q = |name: &str, at: f64| d.hists.get(name).filter(|h| h.n > 0).map(|h| h.quantile(bounds(name), at));
+        let (cpu, mem) = (format!("{}.app", name::CPU_PCT), format!("{}.app", name::MEMORY_MB));
         Some(DayTotals {
             counts: d.counts.clone(),
-            cpu_p95: p95(&format!("{}.app", name::CPU_PCT)),
-            mem_p95: p95(&format!("{}.app", name::MEMORY_MB)),
+            cpu_p95: q(&cpu, 0.95),
+            mem_p95: q(&mem, 0.95),
+            cpu_p50: q(&cpu, 0.5),
+            mem_p50: q(&mem, 0.5),
+            core_mem_p95: q(&format!("{}.core", name::MEMORY_MB), 0.95),
+            start_ms: q(name::APP_START_MS, 0.5),
         })
     }
 
@@ -455,6 +460,13 @@ pub struct DayTotals {
     pub counts: BTreeMap<String, u64>,
     pub cpu_p95: Option<f64>,
     pub mem_p95: Option<f64>,
+    /// The app's usual load and memory (the median of the day's readings).
+    pub cpu_p50: Option<f64>,
+    pub mem_p50: Option<f64>,
+    /// The network core's memory (mihomo), the high end of the day.
+    pub core_mem_p95: Option<f64>,
+    /// How long the app took from start to its first screen, the median of the day's starts.
+    pub start_ms: Option<f64>,
 }
 
 /// Memory and processor time of one process, as the system reports them.
@@ -508,8 +520,23 @@ pub fn sample_process(pid: u32) -> Option<ProcSample> {
     Some(ProcSample { working_set_mb: pages * page / 1_048_576.0, cpu_secs: ticks / hz })
 }
 
-/// shortcut: no reading on macOS yet, add one (`proc_pidinfo`) when its numbers are needed.
-#[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
+#[cfg(target_os = "macos")]
+#[allow(deprecated)] // mach_timebase_info: libc points to the mach2 crate, the call itself is fine
+pub fn sample_process(pid: u32) -> Option<ProcSample> {
+    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    let got = unsafe { libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTASKINFO, 0, &mut info as *mut _ as *mut libc::c_void, size) };
+    if got != size {
+        return None;
+    }
+    // processor time comes in Mach ticks, which are not nanoseconds on Apple Silicon
+    let mut tb = libc::mach_timebase_info { numer: 0, denom: 0 };
+    unsafe { libc::mach_timebase_info(&mut tb) };
+    let ns = |t: u64| if tb.denom == 0 { t as f64 } else { t as f64 * tb.numer as f64 / tb.denom as f64 };
+    Some(ProcSample { working_set_mb: info.pti_resident_size as f64 / 1_048_576.0, cpu_secs: (ns(info.pti_total_user) + ns(info.pti_total_system)) / 1e9 })
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "android", target_os = "macos")))]
 pub fn sample_process(_pid: u32) -> Option<ProcSample> {
     None
 }
