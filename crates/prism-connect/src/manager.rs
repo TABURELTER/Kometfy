@@ -2750,6 +2750,18 @@ impl Manager {
     }
 
     async fn start_tg(&self) -> Result<()> {
+        // a bridge chosen before it ever ran (a fresh install's default) has no secret yet: make it now
+        let fresh = {
+            let mut s = self.settings.write().unwrap();
+            let fresh = s.tg.secret.is_empty();
+            if fresh {
+                s.tg.secret = crate::tgbridge::new_secret();
+            }
+            fresh
+        };
+        if fresh {
+            self.save_settings()?;
+        }
         let t = self.settings().tg;
         // the user's own domains first, then the project's from the backend (the built-in one comes last)
         let mut domains = t.cf_domains.clone();
