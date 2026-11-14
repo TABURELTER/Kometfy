@@ -522,6 +522,13 @@ impl Manager {
         if self.profiles.lock().unwrap().items().is_empty() {
             s.app_mode = crate::settings::AppMode::FreeAntiDpi;
         }
+        // macOS: the free mode captures with the system proxy. In the TUN the DPI engine's own connections come back
+        // in, and mihomo sees no process names there to send them out (measured 2026-11-14: YouTube and Discord
+        // dead in a loop); the free mode needs no TUN, Telegram has its own bridge.
+        #[cfg(target_os = "macos")]
+        if s.app_mode == crate::settings::AppMode::FreeAntiDpi && s.method == Method::Tun {
+            s.method = Method::SystemProxy;
+        }
         s
     }
 
@@ -934,7 +941,8 @@ impl Manager {
                     version: if cfg!(windows) { version } else { engine.then(|| crate::byedpi::VERSION.to_string()) },
                     running: self.zapret.pid().is_some(),
                     paused: settings.zapret.enabled && vpn_on(&settings) && self.zapret.pid().is_none(),
-                    strategy: settings.zapret.strategy.clone(),
+                    // the one that runs: a name this platform lacks (Windows' "general" on a fresh phone) runs the first
+                    strategy: self.zapret_strategy(&settings.zapret.strategy).map(|x| x.name).unwrap_or_else(|_| settings.zapret.strategy.clone()),
                     error: self.zapret_error.lock().unwrap().clone(),
                     finding: self.zapret_find.lock().unwrap().clone(),
                 }
