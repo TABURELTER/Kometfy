@@ -258,6 +258,9 @@ pub struct Manager {
     zapret_out: Arc<Mutex<VecDeque<String>>>,
     zapret_error: Mutex<Option<String>>,
     zapret_find: Mutex<Option<ZapretProgress>>,
+    /// The DPI engine was started and should be running: the monitor brings it back when it exits on its own (a
+    /// phone's battery saver kills it, or it crashes). Cleared whenever it is stopped on purpose.
+    dpi_alive: AtomicBool,
     /// The bigger ad list is being downloaded.
     ads_more_busy: AtomicBool,
 }
@@ -510,6 +513,7 @@ impl Manager {
             tg: Mutex::new(None),
             tg_error: Mutex::new(None),
             zapret: Core::default(),
+            dpi_alive: AtomicBool::new(false),
             zapret_out: Arc::new(Mutex::new(VecDeque::new())),
             zapret_error: Mutex::new(None),
             zapret_find: Mutex::new(None),
@@ -947,11 +951,8 @@ impl Manager {
                     running: self.zapret.pid().is_some(),
                     paused: settings.zapret.enabled && vpn_on(&settings) && self.zapret.pid().is_none(),
                     // the one that runs: a name this platform lacks (Windows' "general" on a fresh phone) runs the first
-                    strategy: if settings.zapret.strategy.is_empty() {
-                        String::new()
-                    } else {
-                        self.zapret_strategy(&settings.zapret.strategy).map(|x| x.name).unwrap_or_else(|_| settings.zapret.strategy.clone())
-                    },
+                    // none until one is chosen that this platform has; the first start picks it
+                    strategy: if self.strategy_chosen() { settings.zapret.strategy.clone() } else { String::new() },
                     error: self.zapret_error.lock().unwrap().clone(),
                     finding: self.zapret_find.lock().unwrap().clone(),
                 }
@@ -1644,7 +1645,7 @@ impl Manager {
             h.abort();
         }
         self.tg.lock().unwrap().take();
-        self.zapret.stop();
+        self.stop_dpi();
         self.core.stop();
         self.stop_xray();
         // leaving on purpose: no marker is left for the next start to count as a crash
@@ -1708,6 +1709,9 @@ impl Manager {
                     me.handle_core_exit().await;
                 } else if me.expected_running.load(SeqCst) && me.xray.pid().is_none() && me.xray_run.lock().unwrap().is_some() {
                     me.revive_xray().await;
+                }
+                if me.dpi_alive.load(SeqCst) && me.zapret.pid().is_none() && me.zapret_find.lock().unwrap().is_none() {
+                    me.revive_dpi().await;
                 }
                 me.sample_resources();
                 #[cfg(target_os = "macos")]
@@ -2007,7 +2011,7 @@ impl Manager {
         if !on {
             self.tg.lock().unwrap().take();
             *self.tg_error.lock().unwrap() = None;
-            self.zapret.stop();
+            self.stop_dpi();
             let r = if s.connected { self.disconnect().await } else { Ok(()) };
             self.emit_state();
             return r;
@@ -2811,7 +2815,7 @@ impl Manager {
             },
         };
         let was = self.zapret.pid().is_some();
-        self.zapret.stop();
+        self.stop_dpi();
         let (dir, tag) = (self.paths.zapret_dir(), rel.tag.clone());
         tokio::task::spawn_blocking(move || crate::zapret::unpack(&zip, &dir, &tag))
             .await
@@ -2843,7 +2847,7 @@ impl Manager {
         }
         let dir = self.paths.zapret_dir();
         crate::zapret::write_user_lists(&dir, &self.settings().zapret.domains)?;
-        self.zapret.stop();
+        self.stop_dpi();
         let bin = dir.join("bin");
         let mut cmd = std::process::Command::new(bin.join("winws.exe"));
         cmd.args(&strat.args).current_dir(&bin);
@@ -2876,13 +2880,14 @@ impl Manager {
             return Err(Error::msg(format!("Zapret stopped right after the start: {why}")));
         }
         info!("zapret runs strategy {}", strat.name);
+        self.dpi_alive.store(true, SeqCst);
         Ok(())
     }
 
     /// Start the DPI engine (Android, macOS) with a strategy, replacing one that runs.
     async fn start_engine(&self, strat: &crate::zapret::Strategy) -> Result<()> {
         let bin = self.dpi_engine().ok_or_else(|| Error::msg("the DPI engine is not part of this build"))?;
-        self.zapret.stop();
+        self.stop_dpi();
         let mut cmd = std::process::Command::new(&bin);
         cmd.args(crate::byedpi::command_args(strat));
         let inner = self.sink();
@@ -2893,6 +2898,7 @@ impl Manager {
             return Err(Error::msg("the DPI engine stopped right after the start"));
         }
         info!("byedpi runs strategy {}", strat.name);
+        self.dpi_alive.store(true, SeqCst);
         Ok(())
     }
 
@@ -2905,8 +2911,9 @@ impl Manager {
             // Zapret waits while the VPN is on (see pause_zapret) and starts when it goes off, and in the free mode
             // it waits for the main switch
             Ok(())
-        } else if on && self.settings().zapret.strategy.is_empty() {
-            // never chosen: try them now and keep the one that gets YouTube's video and Discord through
+        } else if on && !self.strategy_chosen() {
+            // never chosen, or a name this platform does not have (Windows' "general" on a phone that came from
+            // 1.0.0): try them now and keep the one that gets YouTube's video and Discord through
             self.zapret_find().await.map(|_| ())
         } else if on {
             let name = self.settings().zapret.strategy;
@@ -2915,7 +2922,7 @@ impl Manager {
                 Err(e) => Err(e),
             }
         } else {
-            self.zapret.stop();
+            self.stop_dpi();
             Ok(())
         };
         *self.zapret_error.lock().unwrap() = r.as_ref().err().filter(|e| !matches!(e, Error::NeedAdmin)).map(|e| e.to_string());
@@ -2929,9 +2936,39 @@ impl Manager {
 
     /// Zapret and the VPN do not mix: winws would bend traffic the VPN already carries, and through the
     /// VPN it is not needed. It waits while the VPN is on; the choice stays remembered.
+    /// Is the stored strategy one this platform has (a Zapret release on Windows, byedpi's list elsewhere)?
+    fn strategy_chosen(&self) -> bool {
+        let name = self.settings().zapret.strategy;
+        !name.is_empty() && self.dpi_strategies().iter().any(|x| x.name == name)
+    }
+
+    /// Stop the DPI engine on purpose: the monitor does not bring it back.
+    fn stop_dpi(&self) {
+        self.dpi_alive.store(false, SeqCst);
+        self.zapret.stop();
+    }
+
+    /// The DPI engine exited on its own while it should run (Android's and MIUI's battery savers kill child
+    /// processes): start it again with the same strategy. An engine that dies right after its start is left down
+    /// with its error, so a broken one is not restarted in a loop.
+    async fn revive_dpi(&self) {
+        warn!("the DPI engine exited on its own; starting it again");
+        self.dpi_alive.store(false, SeqCst);
+        let name = self.settings().zapret.strategy;
+        let r = match self.zapret_strategy(&name) {
+            Ok(strat) => self.start_zapret_with(&strat).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = &r {
+            warn!("the DPI engine did not come back: {e}");
+            *self.zapret_error.lock().unwrap() = Some(e.to_string());
+        }
+        self.emit_state();
+    }
+
     fn pause_zapret(&self) {
         if vpn_on(&self.settings()) && self.zapret.pid().is_some() {
-            self.zapret.stop();
+            self.stop_dpi();
             info!("zapret waits while the VPN is on");
         }
     }
@@ -2995,7 +3032,7 @@ impl Manager {
             if got.youtube > 0 {
                 scored.push((got, strat.clone()));
             }
-            self.zapret.stop();
+            self.stop_dpi();
         }
         // none got everything through every time: the best few once more, and the best sum wins
         if found.is_none() {
@@ -3004,7 +3041,7 @@ impl Manager {
             let mut best: Option<(crate::zapret::Probe, crate::zapret::Strategy)> = None;
             for (j, (first, strat)) in scored.into_iter().enumerate() {
                 let again = self.probe_strategy(&strat, all.len() + j, total, &mut video, via.as_deref(), &sites).await.unwrap_or_default();
-                self.zapret.stop();
+                self.stop_dpi();
                 let sum = first.plus(again);
                 if best.as_ref().is_none_or(|(b, _)| sum.beats(b)) {
                     best = Some((sum, strat));
