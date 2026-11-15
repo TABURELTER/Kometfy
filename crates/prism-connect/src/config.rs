@@ -320,6 +320,84 @@ pub(crate) fn configure_preopened_tun(
 /// builder owns the interface and the routes, and the app is kept out of the VPN, so the core's own
 /// connections already leave by the real network: it must not set up routes or look for a default
 /// interface (an app may not read the routing table on current Android).
+/// The tunnel's MTU on Android. Big packets inside the tunnel never reach the network (the core's own connections
+/// leave by the real one), and gvisor, the core's stack there, then handles a few big packets instead of many
+/// small ones: a quarter less of the core's processor time per megabyte at the same speed (Huawei tablet, 84 Mbit/s:
+/// 79 ms/MB against 100-115 at 1500). Clash Meta for Android and sing-box use 9000 too.
+pub const ANDROID_MTU: u32 = 9000;
+
+/// Android's free mode: the core hands fake addresses only to the names its rules do something with (the bypass
+/// engine, the AI proxy, ad blocking) and real ones to every other name, so the tunnel can take only the fake
+/// range and the rest of a phone's traffic never passes the core's network stack, which costs a phone's
+/// processor for traffic the core would only send direct. A whitelist is safe with a whole-traffic tunnel too:
+/// the core then finds the names in the connections, as before.
+/// None when the rules do something with traffic it cannot tell by name (by address, port or app, a keyword, or
+/// a catch-all that is not DIRECT): then the whole traffic has to go through the core.
+pub fn fake_ip_only_for_core(yaml: &str) -> Result<Option<String>> {
+    let mut root = parse_root(Some(yaml))?;
+    let behavior = |name: &str| {
+        root.get("rule-providers")
+            .and_then(|p| p.get(name))
+            .and_then(|p| p.get("behavior"))
+            .and_then(Value::as_str)
+            .unwrap_or("classical")
+            .to_string()
+    };
+    let rules: Vec<String> = root.get("rules").and_then(Value::as_sequence).map(|r| r.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+    let mut names: Vec<String> = Vec::new();
+    let mut ends_direct = false;
+    for rule in &rules {
+        let parts: Vec<&str> = rule.split(',').map(str::trim).collect();
+        let (kind, target) = match parts.first() {
+            Some(&"MATCH") => {
+                ends_direct = parts.get(1) == Some(&"DIRECT");
+                break;
+            }
+            Some(&("AND" | "OR" | "NOT")) => (parts[0], parts.iter().rev().find(|p| !p.ends_with(')')).copied().unwrap_or("")),
+            Some(k) => (*k, parts.get(2).copied().unwrap_or("")),
+            None => continue,
+        };
+        if target == "DIRECT" {
+            continue;
+        }
+        let mut terms: Vec<(String, String)> = Vec::new();
+        if matches!(kind, "AND" | "OR" | "NOT") {
+            // the names inside a logic rule; one with none (by port or network alone) needs the whole traffic
+            let flat = rule.replace(['(', ')'], ",");
+            let tokens: Vec<&str> = flat.split(',').map(str::trim).filter(|t| !t.is_empty()).collect();
+            for w in tokens.windows(2) {
+                if matches!(w[0], "DOMAIN" | "DOMAIN-SUFFIX" | "RULE-SET" | "GEOSITE") {
+                    terms.push((w[0].to_string(), w[1].to_string()));
+                }
+            }
+            if terms.is_empty() {
+                return Ok(None);
+            }
+        } else {
+            terms.push((kind.to_string(), parts.get(1).copied().unwrap_or("").to_string()));
+        }
+        for (kind, value) in terms {
+            let name = match kind.as_str() {
+                "DOMAIN" => value,
+                "DOMAIN-SUFFIX" => format!("+.{value}"),
+                "GEOSITE" => format!("geosite:{value}"),
+                "RULE-SET" if behavior(&value) == "domain" => format!("rule-set:{value}"),
+                _ => return Ok(None),
+            };
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    let Some(dns) = root.get_mut("dns").and_then(Value::as_mapping_mut) else { return Ok(None) };
+    if !ends_direct || dns.get("enhanced-mode").and_then(Value::as_str) != Some("fake-ip") {
+        return Ok(None);
+    }
+    put(dns, "fake-ip-filter-mode", "whitelist");
+    put(dns, "fake-ip-filter", strs(names));
+    Ok(Some(serde_yaml::to_string(&root)?))
+}
+
 #[cfg(any(target_os = "android", test))]
 pub(crate) fn configure_android_tun(yaml: &str, fd: i32) -> Result<String> {
     if fd < 3 {
@@ -342,7 +420,9 @@ pub(crate) fn configure_android_tun(yaml: &str, fd: i32) -> Result<String> {
     tun.remove("device");
     put(tun, "enable", true);
     put(tun, "file-descriptor", fd);
+    // the system and mixed stacks carry nothing over the service's descriptor (measured on Android 12)
     put(tun, "stack", "gvisor");
+    put(tun, "mtu", ANDROID_MTU);
     put(tun, "auto-route", false);
     put(tun, "auto-redirect", false);
     put(tun, "auto-detect-interface", false);
@@ -1025,6 +1105,24 @@ mod tests {
         assert!(configure_preopened_tun(input, 2, plan).is_err());
         assert!(configure_preopened_tun("tun: {enable: false}", 42, plan).is_err());
         assert!(configure_preopened_tun("{}", 42, plan).is_err());
+    }
+
+    #[test]
+    fn the_free_mode_hands_fake_addresses_only_to_what_the_core_works_on() {
+        let free = "dns: {enable: true, enhanced-mode: fake-ip, fake-ip-range: 198.18.0.1/16, fake-ip-filter: ['*.lan']}\n\
+            rule-providers:\n  kometfy-youtube: {type: http, behavior: domain, format: mrs, url: 'https://x', path: ./y.mrs}\n\
+            rules:\n- PROCESS-NAME,bf6.exe,DIRECT\n- IP-CIDR,10.0.0.0/8,DIRECT,no-resolve\n- AND,((NETWORK,UDP),(DOMAIN-SUFFIX,googlevideo.com)),DPI\n\
+            - AND,((NETWORK,UDP),(DST-PORT,443)),DIRECT\n- RULE-SET,kometfy-youtube,DPI\n- DOMAIN-SUFFIX,discord.com,DPI\n- DOMAIN,ads.example,REJECT\n- MATCH,DIRECT\n";
+        let out = fake_ip_only_for_core(free).unwrap().expect("a free config splits");
+        let root: Mapping = serde_yaml::from_str(&out).unwrap();
+        let dns = root.get("dns").and_then(Value::as_mapping).unwrap();
+        assert_eq!(dns.get("fake-ip-filter-mode").and_then(Value::as_str), Some("whitelist"));
+        let names: Vec<&str> = dns.get("fake-ip-filter").and_then(Value::as_sequence).unwrap().iter().filter_map(Value::as_str).collect();
+        assert_eq!(names, ["+.googlevideo.com", "rule-set:kometfy-youtube", "+.discord.com", "ads.example"]);
+        // something told apart by address, or a catch-all through a proxy, needs the whole traffic
+        assert!(fake_ip_only_for_core(&free.replace("MATCH,DIRECT", "MATCH,PROXY")).unwrap().is_none());
+        assert!(fake_ip_only_for_core(&free.replace("IP-CIDR,10.0.0.0/8,DIRECT", "IP-CIDR,10.0.0.0/8,DPI")).unwrap().is_none());
+        assert!(fake_ip_only_for_core(&free.replace("AND,((NETWORK,UDP),(DST-PORT,443)),DIRECT", "AND,((NETWORK,UDP),(DST-PORT,443)),DPI")).unwrap().is_none());
     }
 
     #[test]

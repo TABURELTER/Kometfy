@@ -47,6 +47,8 @@ use crate::util::CREATE_NO_WINDOW;
 pub type Emitter = Arc<dyn Fn(&str, Value) + Send + Sync>;
 
 const LOG_RING: usize = 500;
+/// How many bypass strategies the search tries at once where the engine is a proxy (Android, macOS).
+const SIDE_BY_SIDE: usize = 4;
 #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 const CONFLICT_PROCESSES: &[(&str, &str)] = &[
     ("clash-verge.exe", "Clash Verge"),
@@ -2166,10 +2168,12 @@ impl Manager {
             // Xray is not part of the Android app (yet): mihomo runs every server
             let built = self.build_config(false, &BTreeMap::new())?;
             let s = self.settings();
+            // the free mode: the tunnel takes only what the core works on (see config::fake_ip_only_for_core)
+            let only = if s.app_mode == crate::settings::AppMode::FreeAntiDpi { config::fake_ip_only_for_core(&built.yaml)? } else { None };
             let fd = vpn
-                .establish(crate::android::VpnParams { mtu: s.tun.mtu, address: "198.18.0.1".into(), prefix: 30, dns: "198.18.0.2".into() })
+                .establish(crate::android::VpnParams { mtu: config::ANDROID_MTU, address: "198.18.0.1".into(), prefix: 30, dns: "198.18.0.2".into(), split: only.is_some() })
                 .await?;
-            let yaml = config::configure_android_tun(&built.yaml, fd)?;
+            let yaml = config::configure_android_tun(only.as_deref().unwrap_or(&built.yaml), fd)?;
             let cfg = self.paths.runtime_config();
             crate::util::write_atomic(&cfg, yaml.as_bytes())?;
             self.validate(&bin, &cfg).await?;
@@ -3006,8 +3010,6 @@ impl Manager {
             *f = Some(ZapretProgress { done: 0, total: 0, name: String::new() });
         }
         let mut all = self.dpi_strategies();
-        // off Windows the probe goes through the engine itself, the way the core will send the sites to it
-        let via = (!cfg!(windows)).then(crate::byedpi::probe_proxy);
         // the strategy in use goes first: when it still works, the search is over in seconds
         let saved = self.settings().zapret.strategy;
         if let Some(i) = all.iter().position(|x| x.name == saved) {
@@ -3018,31 +3020,54 @@ impl Manager {
         let sites = self.settings().zapret.domains;
         // round two re-checks the best few: the provider's filter wavers, and one lucky round should not win
         const FINALISTS: usize = 3;
+        // winws takes every connection of the system, so Windows tries one strategy at a time; byedpi is a proxy,
+        // so a few engines on ports of their own are tried side by side (four at a time: 3 times faster on the
+        // Mac, with the same scores; examples/dpi_bench.rs)
+        let at_once = if cfg!(windows) { 1 } else { SIDE_BY_SIDE };
         let total = all.len() + FINALISTS;
         let mut found = None;
         let mut scored: Vec<(crate::zapret::Probe, crate::zapret::Strategy)> = Vec::new();
         let mut video = None;
-        for (i, strat) in all.iter().enumerate() {
-            let Some(got) = self.probe_strategy(strat, i, total, &mut video, via.as_deref(), &sites).await else { continue };
-            // a perfect one ends the search
-            if got.all() {
-                found = Some(strat.name.clone());
-                break;
+        let mut done = 0;
+        'search: for batch in all.chunks(at_once) {
+            let got = self.probe_batch(batch, done, total, &mut video, &sites).await;
+            done += batch.len();
+            for (strat, got) in batch.iter().zip(got) {
+                let Some(got) = got else { continue };
+                // a perfect one ends the search
+                if got.all() {
+                    found = Some(strat.clone());
+                    break 'search;
+                }
+                if got.youtube > 0 {
+                    scored.push((got, strat.clone()));
+                }
             }
-            if got.youtube > 0 {
-                scored.push((got, strat.clone()));
+            if cfg!(windows) {
+                self.stop_dpi();
             }
-            self.stop_dpi();
         }
+        // winws already runs the perfect one; elsewhere its engine of the search is gone, the real one takes it
+        let mut found = match found {
+            Some(strat) if !cfg!(windows) => self.start_zapret_with(&strat).await.is_ok().then_some(strat.name),
+            other => other.map(|s| s.name),
+        };
         // none got everything through every time: the best few once more, and the best sum wins
         if found.is_none() {
             scored.sort_by(|a, b| if a.0.beats(&b.0) { std::cmp::Ordering::Less } else if b.0.beats(&a.0) { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Equal });
             scored.truncate(FINALISTS);
+            let (firsts, finalists): (Vec<_>, Vec<_>) = scored.into_iter().unzip();
+            let mut again = Vec::new();
+            for batch in finalists.chunks(at_once) {
+                again.extend(self.probe_batch(batch, done, total, &mut video, &sites).await);
+                done += batch.len();
+                if cfg!(windows) {
+                    self.stop_dpi();
+                }
+            }
             let mut best: Option<(crate::zapret::Probe, crate::zapret::Strategy)> = None;
-            for (j, (first, strat)) in scored.into_iter().enumerate() {
-                let again = self.probe_strategy(&strat, all.len() + j, total, &mut video, via.as_deref(), &sites).await.unwrap_or_default();
-                self.stop_dpi();
-                let sum = first.plus(again);
+            for ((first, strat), again) in firsts.into_iter().zip(finalists).zip(again) {
+                let sum = first.plus(again.unwrap_or_default());
                 if best.as_ref().is_none_or(|(b, _)| sum.beats(b)) {
                     best = Some((sum, strat));
                 }
@@ -3077,15 +3102,67 @@ impl Manager {
         r
     }
 
-    /// Run one strategy and probe it; None when it does not start. The engine is left running.
-    async fn probe_strategy(&self, strat: &crate::zapret::Strategy, step: usize, total: usize, video: &mut Option<String>, via: Option<&str>, sites: &[String]) -> Option<crate::zapret::Probe> {
-        *self.zapret_find.lock().unwrap() = Some(ZapretProgress { done: step, total, name: strat.name.clone() });
+    /// Probe a few strategies; None for one that does not start. On Windows (one at a time) winws runs the
+    /// strategy and is left running. Elsewhere each strategy gets an engine of its own on a port of its own,
+    /// probed through it the way the core will send the sites to it, and stopped after: the engine in use stays.
+    async fn probe_batch(&self, batch: &[crate::zapret::Strategy], step: usize, total: usize, video: &mut Option<String>, sites: &[String]) -> Vec<Option<crate::zapret::Probe>> {
+        let names: Vec<&str> = batch.iter().map(|s| s.name.as_str()).collect();
+        *self.zapret_find.lock().unwrap() = Some(ZapretProgress { done: step, total, name: names.join(", ") });
         self.emit_state();
-        self.start_zapret_with(strat).await.ok()?;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let got = crate::zapret::probe(video, via, sites).await;
-        info!("zapret: {}: YouTube {}/{}, Discord {}/{}, own sites {}/{}", strat.name, got.youtube, got.youtube_of, got.discord, got.discord_of, got.sites, got.sites_of);
-        Some(got)
+        let got: Vec<Option<crate::zapret::Probe>> = if cfg!(windows) {
+            let mut out = Vec::new();
+            for strat in batch {
+                out.push(match self.start_zapret_with(strat).await {
+                    Ok(()) => {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        Some(crate::zapret::probe(video, None, sites).await)
+                    }
+                    Err(_) => None,
+                });
+            }
+            out
+        } else {
+            let Some(bin) = self.dpi_engine() else { return vec![None; batch.len()] };
+            let runs = batch.iter().enumerate().map(|(i, strat)| {
+                let (bin, mut node) = (bin.clone(), video.clone());
+                let port = crate::byedpi::PORT + 1 + i as u16;
+                async move {
+                    let mut child = tokio::process::Command::new(&bin)
+                        .args(crate::byedpi::command_args_on(strat, port))
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .kill_on_drop(true)
+                        .spawn()
+                        .ok()?;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    // a bad argument or a taken port makes it quit at once
+                    if !matches!(child.try_wait(), Ok(None)) {
+                        warn!("zapret: the engine for {} did not start on port {port}", strat.name);
+                        return None;
+                    }
+                    let got = crate::zapret::probe(&mut node, Some(&format!("socks5h://127.0.0.1:{port}")), sites).await;
+                    let _ = child.kill().await;
+                    Some((got, node))
+                }
+            });
+            let mut out = Vec::new();
+            for r in futures_util::future::join_all(runs).await {
+                out.push(r.map(|(got, node)| {
+                    if video.is_none() {
+                        *video = node;
+                    }
+                    got
+                }));
+            }
+            out
+        };
+        for (strat, got) in batch.iter().zip(&got) {
+            if let Some(got) = got {
+                info!("zapret: {}: YouTube {}/{}, Discord {}/{}, own sites {}/{}", strat.name, got.youtube, got.youtube_of, got.discord, got.discord_of, got.sites, got.sites_of);
+            }
+        }
+        got
     }
 
     /// The strategy, the user's own sites and the game filter. A running winws starts again with them.

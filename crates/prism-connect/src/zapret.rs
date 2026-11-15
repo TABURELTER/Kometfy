@@ -352,22 +352,17 @@ pub async fn probe(node: &mut Option<String>, via: Option<&str>, sites: &[String
     else {
         return Probe::default();
     };
-    if node.is_none() {
-        // the page that names the video server; without it YouTube itself does not open
-        match video_server(&http).await {
-            Some(found) => *node = Some(found),
-            None => tracing::info!("probe: the YouTube page did not load"),
-        }
-    }
-    let host = node.clone().unwrap_or_else(|| VIDEO_FALLBACK.to_string());
     let hello = |h: &str| Check::Hello(h.to_string());
-    let youtube = [
-        hello("www.youtube.com"),
-        hello("youtubei.googleapis.com"),
-        Check::Whole(THUMB.into()),
-        hello(&host),
-        Check::Upload(format!("https://{host}/videoplayback")),
-    ];
+    let youtube_of = |host: &str| {
+        [
+            hello("www.youtube.com"),
+            hello("youtubei.googleapis.com"),
+            Check::Whole(THUMB.into()),
+            hello(host),
+            Check::Upload(format!("https://{host}/videoplayback")),
+        ]
+    };
+    let mut youtube = youtube_of(node.as_deref().unwrap_or(VIDEO_FALLBACK));
     // a small answer on purpose: Discord's home page is 170 KB, more than a slow line fetches in time
     let discord = [
         hello("discord.com"),
@@ -376,9 +371,41 @@ pub async fn probe(node: &mut Option<String>, via: Option<&str>, sites: &[String
         Check::Upload("https://discord.com/api/v9/gateway".into()),
     ];
     let own: Vec<Check> = sites.iter().take(MAX_SITES).map(|d| hello(d)).collect();
-    let ((yt, yt_of), (dc, dc_of), (st, st_of)) =
-        tokio::join!(score(&http, via, &youtube), score(&http, via, &discord), score(&http, via, &own));
-    Probe { youtube: yt, youtube_of: yt_of, discord: dc, discord_of: dc_of, sites: st, sites_of: st_of }
+    let (mut yt_gone, mut dc_gone, mut own_gone) = (vec![false; youtube.len()], vec![false; discord.len()], vec![false; own.len()]);
+    let mut got = Probe::default();
+    let mut look = node.is_none();
+    for n in 0..TRIES {
+        // the page that names the video server is read alongside the first round, which checks a common video
+        // server meanwhile; read before it, a page that stalled held every strategy up for up to 10 s. Seven
+        // seconds is as long as a round can take anyway.
+        let lookup = async {
+            if !std::mem::take(&mut look) {
+                return None;
+            }
+            let found = tokio::time::timeout(Duration::from_secs(7), video_server(&http)).await.ok().flatten();
+            if found.is_none() {
+                tracing::info!("probe: the YouTube page did not load");
+            }
+            found
+        };
+        let (found, (yt, yt_of), (dc, dc_of), (st, st_of)) = tokio::join!(
+            lookup,
+            round(&http, via, &youtube, &mut yt_gone),
+            round(&http, via, &discord, &mut dc_gone),
+            round(&http, via, &own, &mut own_gone)
+        );
+        got = got.plus(Probe { youtube: yt, youtube_of: yt_of, discord: dc, discord_of: dc_of, sites: st, sites_of: st_of });
+        if let Some(host) = found {
+            youtube = youtube_of(&host);
+            *node = Some(host);
+        }
+        // nothing of YouTube got through: the next rounds would only wait out the same timeouts again, and most
+        // strategies of a search fail, so this is where a search spends its time
+        if n == 0 && got.youtube == 0 {
+            break;
+        }
+    }
+    got
 }
 
 /// The user's own sites checked by a probe, at most.
@@ -421,7 +448,7 @@ impl Check {
                 .await,
             ),
             Check::Upload(url) => {
-                done(http.post(url).body(vec![0u8; 64 * 1024]).timeout(Duration::from_secs(6)).send().await.map(drop).map_err(err))
+                done(http.post(url).body(vec![0u8; 64 * 1024]).timeout(Duration::from_secs(4)).send().await.map(drop).map_err(err))
             }
         }
     }
@@ -433,25 +460,26 @@ impl Check {
     }
 }
 
-/// Every check `TRIES` times in a row (the checks run side by side): how many tries got through, out of how
-/// many counted. A check whose address takes no TCP connection is not counted and not tried again.
-async fn score(http: &reqwest::Client, via: Option<&str>, checks: &[Check]) -> (u32, u32) {
-    let runs = checks.iter().map(|c| async move {
-        let (mut ok, mut of) = (0, 0);
-        for _ in 0..TRIES {
-            match c.once(http, via).await {
-                Try::Ok => ok += 1,
-                Try::Failed(e) => tracing::debug!("probe: {}: {e}", c.what()),
-                Try::Unreachable => {
-                    tracing::debug!("probe: {}: no TCP connection", c.what());
-                    return (ok, of);
-                }
+/// Every check once, side by side: how many got through, out of how many counted. A check whose address takes no
+/// TCP connection is not counted, and `gone` keeps it out of the next rounds: no strategy changes that.
+async fn round(http: &reqwest::Client, via: Option<&str>, checks: &[Check], gone: &mut [bool]) -> (u32, u32) {
+    let runs = checks.iter().zip(gone.iter()).map(|(c, &out)| async move { (!out).then_some(c.once(http, via).await) });
+    let (mut ok, mut of) = (0, 0);
+    for (i, t) in futures_util::future::join_all(runs).await.into_iter().enumerate() {
+        match t {
+            None => {}
+            Some(Try::Ok) => (ok, of) = (ok + 1, of + 1),
+            Some(Try::Failed(e)) => {
+                tracing::debug!("probe: {}: {e}", checks[i].what());
+                of += 1;
             }
-            of += 1;
+            Some(Try::Unreachable) => {
+                tracing::debug!("probe: {}: no TCP connection", checks[i].what());
+                gone[i] = true;
+            }
         }
-        (ok, of)
-    });
-    futures_util::future::join_all(runs).await.into_iter().fold((0, 0), |(a, b), (c, d)| (a + c, b + d))
+    }
+    (ok, of)
 }
 
 /// A remote test's site check: one TLS handshake with `host` (directly, or through a SOCKS5 proxy given as
@@ -482,7 +510,9 @@ async fn hello(host: &str, via: Option<&str>) -> Try {
         stream.read_exact(&mut head).await?;
         Ok::<_, std::io::Error>(head[0] == 0x16 && head[1] == 3 && head[5] == 2)
     };
-    match tokio::time::timeout(Duration::from_secs(4), answer).await {
+    // a server hello comes back in well under a second where the path works; a strategy the filter catches is
+    // just silence, and the search waits it out on most strategies
+    match tokio::time::timeout(Duration::from_secs(3), answer).await {
         Ok(Ok(true)) => Try::Ok,
         Ok(Ok(false)) => Try::Failed("not a server hello".into()),
         Ok(Err(e)) => Try::Failed(e.to_string()),

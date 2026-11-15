@@ -19,6 +19,10 @@ pub struct VpnParams {
     pub address: String,
     pub prefix: u8,
     pub dns: String,
+    /// Route only the core's fake-IP range (198.18.0.0/16) into the tunnel: the free mode,
+    /// where the core does something only with the names it hands fake addresses to. The service still takes the
+    /// whole traffic when the system resolves names past the tunnel (a strict Private DNS).
+    pub split: bool,
 }
 
 pub trait AndroidVpn: Send + Sync {

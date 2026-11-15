@@ -80,7 +80,12 @@ pub fn names() -> Vec<String> {
 
 /// The engine's command line for one strategy.
 pub fn command_args(strat: &Strategy) -> Vec<String> {
-    let mut args = vec!["-i".to_string(), "127.0.0.1".into(), "-p".into(), PORT.to_string()];
+    command_args_on(strat, PORT)
+}
+
+/// The same on another port: the search runs a few engines side by side, each on a port of its own.
+pub fn command_args_on(strat: &Strategy, port: u16) -> Vec<String> {
+    let mut args = vec!["-i".to_string(), "127.0.0.1".into(), "-p".into(), port.to_string()];
     args.extend(strat.args.iter().cloned());
     args
 }

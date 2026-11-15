@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/prism-connect"]
 
 [workspace.package]
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 authors = ["Dmitriy (TABURELTER)"]
 license = "GPL-3.0-only"
@@ -20,6 +20,14 @@ thiserror = "2.0"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 uuid = { version = "1.10", features = ["v4", "serde"] }
 winreg = "0.52"
+
+# Debug builds keep file:line for panics and backtraces in our own code and drop debug info elsewhere: full
+# debug info grew target/debug to 44 GB.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
 
 [profile.release]
 lto = "thin"
