@@ -632,14 +632,20 @@ pub const GAME_SITES: [&str; 8] = [
     "squadbustersgame.com", "haydaygame.com", "boombeachgame.com",
 ];
 
-/// Ask the gaming DNS for the games' names only, and send their traffic direct (past a VPN, for the lowest
-/// ping), right above the LAN rules: below the user's own rules and ad blocking, above a profile's rules.
-/// It reaches the games whose traffic goes through the core: on a phone, and with TUN on a computer.
-/// `servers`: the gaming DNS servers; without them the YAML is left as it is.
+/// Roblox's pictures (game icons, the catalog, avatars: tr.rbxcdn.com and the rest of rbxcdn.com). Roblox's DNS gives
+/// a resolver in Russia a chain of names with no address at its end, so the pictures stay grey, while the same CDN
+/// answers a resolver abroad and its edges open fine from Russia. Asked through Google's DNS as if from Finland (EDNS
+/// Client Subnet), the names get those edges. Measured from Russia on 16 November 2026: no address without the
+/// subnet, an Akamai edge with it, and the icon loaded in 0.17 s. Only the name is resolved this way: Roblox's
+/// traffic keeps its route (through the VPN where the mode sends it there).
+const ROBLOX_CDN: &str = "+.rbxcdn.com";
+const ROBLOX_DNS: &str = "https://dns.google/dns-query#ecs=95.216.0.0/24&ecs-override=true";
+
+/// The "Games" switch. Roblox's pictures get a resolver that finds them ([`ROBLOX_CDN`]). With the gaming DNS from the
+/// app build (`servers`), Supercell's games ask it for their names and their traffic goes direct (past a VPN, for
+/// the lowest ping), right above the LAN rules: below the user's own rules and ad blocking, above a profile's rules.
+/// It reaches the games whose names and traffic go through the core: on a phone, and with TUN on a computer.
 pub fn with_games(yaml: &str, extra: &[String], servers: &[String]) -> Result<String> {
-    if servers.is_empty() {
-        return Ok(yaml.to_string());
-    }
     let sites = merged(&GAME_SITES, extra);
     let mut root: Mapping = serde_yaml::from_str(yaml)?;
     let dns = root.entry(k("dns")).or_insert_with(|| Value::Mapping(Mapping::new()));
@@ -648,10 +654,16 @@ pub fn with_games(yaml: &str, extra: &[String], servers: &[String]) -> Result<St
             dns.insert(k("nameserver-policy"), Value::Mapping(Mapping::new()));
         }
         if let Some(Value::Mapping(policy)) = dns.get_mut("nameserver-policy") {
-            for d in &sites {
-                policy.insert(k(&format!("+.{d}")), Value::Sequence(servers.iter().map(|s| Value::from(s.as_str())).collect()));
+            policy.insert(k(ROBLOX_CDN), Value::Sequence(vec![Value::from(ROBLOX_DNS)]));
+            if !servers.is_empty() {
+                for d in &sites {
+                    policy.insert(k(&format!("+.{d}")), Value::Sequence(servers.iter().map(|s| Value::from(s.as_str())).collect()));
+                }
             }
         }
+    }
+    if servers.is_empty() {
+        return Ok(serde_yaml::to_string(&root)?);
     }
     if !matches!(root.get("rule-providers"), Some(Value::Mapping(_))) {
         root.insert(k("rule-providers"), Value::Mapping(Mapping::new()));
@@ -1038,7 +1050,12 @@ mod tests {
         let yaml = "proxies:\n  - {name: a, type: ss, server: 1.1.1.1, port: 1, cipher: aes-128-gcm, password: x}\nrules:\n  - DOMAIN-SUFFIX,brawlstarsgame.com,a\n  - MATCH,a\n";
         let s = Settings { adblock: true, ..Settings::default() };
         let b = build_with_rules(Some(yaml), None, &s, &[], &[], false).unwrap();
-        assert_eq!(with_games(&b.yaml, &[], &[]).unwrap(), b.yaml, "no gaming DNS from the app: nothing changes");
+        // no gaming DNS from the app: Roblox's pictures get their resolver, Supercell's names and rules are left alone
+        let roblox: Mapping = serde_yaml::from_str(&with_games(&b.yaml, &[], &[]).unwrap()).unwrap();
+        let policy = roblox.get("dns").and_then(|d| d.get("nameserver-policy")).and_then(Value::as_mapping).unwrap();
+        assert_eq!(policy.get(ROBLOX_CDN).and_then(Value::as_sequence).and_then(|s| s[0].as_str()), Some(ROBLOX_DNS));
+        assert!(policy.get("+.brawlstarsgame.com").is_none());
+        assert!(!serde_yaml::to_string(&roblox).unwrap().contains("kometfy-games"));
         let out = with_games(&b.yaml, &["supercell.net".into(), "newgame.example".into()], &["https://dns.example/dns-query".into()]).unwrap();
         assert!(out.contains("+.newgame.example"));
         let root: Mapping = serde_yaml::from_str(&out).unwrap();

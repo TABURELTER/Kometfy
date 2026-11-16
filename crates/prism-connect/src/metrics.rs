@@ -284,6 +284,11 @@ impl Metrics {
         self.on.store(on, SeqCst);
     }
 
+    /// Ensure there is an aggregate for today without inventing an event or connection.
+    pub fn ensure_today(&self) {
+        self.with_day(|_| {});
+    }
+
     fn with_day(&self, f: impl FnOnce(&mut Day)) {
         if !self.on.load(SeqCst) {
             return;

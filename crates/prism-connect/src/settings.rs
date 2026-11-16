@@ -291,10 +291,14 @@ pub struct Settings {
     pub adblock: bool,
     /// In the free mode, send AI services (ChatGPT, Claude, Gemini and others) through a free public proxy.
     pub ai_access: bool,
-    /// Supercell's games (Brawl Stars and others) through a gaming DNS, direct, in every mode.
+    /// "Games": Roblox's pictures through a resolver that finds them, Supercell's games (Brawl Stars and others)
+    /// through a gaming DNS, direct, in every mode.
     pub games_dns: bool,
     /// The welcome screen has been through: it asks the questions below once.
     pub onboarded: bool,
+    /// This settings file was created for a fresh install and the first welcome has not been completed yet.
+    /// Older settings files default to false so their existing privacy choices remain untouched.
+    pub consent_fresh: bool,
     /// Which set of questions the user has answered: when the welcome screen asks something new, it shows again
     /// (see `CONSENT_REV`).
     pub consent_rev: u32,
@@ -362,6 +366,7 @@ impl Default for Settings {
             ai_access: false,
             games_dns: false,
             onboarded: false,
+            consent_fresh: false,
             consent_rev: 0,
             consent_stats: false,
             consent_network: false,
@@ -376,10 +381,11 @@ impl Default for Settings {
 
 impl Settings {
     pub fn load(path: &Path) -> Self {
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default()
+        match std::fs::read_to_string(path) {
+            Ok(t) => serde_json::from_str(&t).unwrap_or_default(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self { consent_fresh: true, ..Self::default() },
+            Err(_) => Self::default(),
+        }
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -436,6 +442,27 @@ mod tests {
         assert!(!Settings::default().free_on, "a fresh install starts nothing before the first press");
         let s: Settings = serde_json::from_str(r#"{"app_mode": "FreeAntiDPI"}"#).unwrap();
         assert_eq!(s.app_mode, AppMode::FreeAntiDpi);
+    }
+
+    #[test]
+    fn only_missing_settings_mark_a_fresh_install_until_welcome_is_finished() {
+        let dir = std::env::temp_dir().join(format!("kometfy-consent-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let file = dir.join("settings.json");
+        let fresh = Settings::load(&file);
+        assert!(fresh.consent_fresh);
+        assert!(!fresh.consent_stats, "suggested choices are not yet saved as consent");
+        fresh.save(&file).unwrap();
+        assert!(Settings::load(&file).consent_fresh, "the marker survives restart before onboarding");
+
+        std::fs::write(&file, r#"{"onboarded":false,"consent_rev":0,"consent_stats":false,"consent_ads":true}"#).unwrap();
+        let previous = Settings::load(&file);
+        assert!(!previous.consent_fresh);
+        assert!(!previous.consent_stats && previous.consent_ads, "existing selections are retained");
+        std::fs::write(&file, "{invalid").unwrap();
+        assert!(!Settings::load(&file).consent_fresh, "corrupt settings are not a fresh installation");
+        assert!(!Settings::load(&dir).consent_fresh, "a non-readable settings path is not a fresh installation");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

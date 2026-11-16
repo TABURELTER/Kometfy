@@ -1,7 +1,7 @@
 //! Addresses an app build hands to the core at start: Kometfy's backend, the project's own Cloudflare domains for
 //! the Telegram bridge, the free AI proxy and the gaming DNS. The open core has none built in: a build that sets
 //! nothing talks to no backend at all (no remote settings, statistics, ads or tests), the bridge uses only the domains
-//! the user entered, and "Access to AI" and "Supercell games" do nothing.
+//! the user entered, and "Access to AI" does nothing ("Games" only fixes Roblox's pictures).
 
 use std::sync::OnceLock;
 

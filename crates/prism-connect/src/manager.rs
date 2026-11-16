@@ -1283,6 +1283,28 @@ impl Manager {
             .collect()
     }
 
+    /// A new consent need not wait for the next ten-minute tick. This only sends the agreed statistics, and
+    /// checks the current choices again after network detection so a changed consent is not taken from a stale copy.
+    fn spawn_initial_stats(self: &Arc<Self>) {
+        let me = self.clone();
+        tokio::spawn(async move {
+            let initial = me.settings();
+            if !initial.consent_stats || initial.install_id.is_empty() {
+                return;
+            }
+            let Some(base) = crate::remote::base_url(&initial.backend_url) else { return };
+            let net = if initial.consent_network { me.net_info(&initial).await } else { Value::Null };
+            let current = me.settings();
+            if !current.consent_stats || current.install_id != initial.install_id || current.backend_url != initial.backend_url {
+                return;
+            }
+            let net = if initial.consent_network && current.consent_network { net } else { Value::Null };
+            if let Err(e) = me.remote.send_stats(&base, &me.stats_bodies(&current, &net)).await {
+                debug!("statistics: {e}");
+            }
+        });
+    }
+
     /// One remote test, run on this device's own network. What comes back never names a server's address, a
     /// site the user opened, a link or a key.
     async fn run_task(self: &Arc<Self>, t: &crate::remote::Task, provider: bool) -> Value {
@@ -1848,6 +1870,51 @@ impl Manager {
     // ---------------------------------------------------------------- config & core
 
     /// `with_xray: false` builds the config for mihomo alone (the fallback when Xray fails).
+    /// Windows may reserve blocks of ports at any start of the system (Hyper-V, WSL and Docker take them from the
+    /// dynamic range, which can begin at 1024): a port the core listened on yesterday is refused today with "an
+    /// attempt was made to access a socket in a way forbidden by its access permissions", and without its
+    /// controller the app cannot drive the core at all. Before the core starts, such a port is swapped for one the
+    /// system hands out, and the settings keep it. A port another program holds is left as it is: that conflict is
+    /// shown to the user, not hidden.
+    fn swap_reserved_ports(&self) {
+        let (mixed, controller) = {
+            let s = self.settings.read().unwrap();
+            (s.mixed_port, s.controller_port)
+        };
+        // the listeners stay open until both ports are picked, so the two never get the same one
+        let mut held = Vec::new();
+        let mut pick = |port: u16| -> Option<u16> {
+            match std::net::TcpListener::bind(("127.0.0.1", port)) {
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    let l = std::net::TcpListener::bind(("127.0.0.1", 0)).ok()?;
+                    let p = l.local_addr().ok()?.port();
+                    held.push(l);
+                    Some(p)
+                }
+                _ => None,
+            }
+        };
+        let (new_controller, new_mixed) = (pick(controller), pick(mixed));
+        if new_controller.is_none() && new_mixed.is_none() {
+            return;
+        }
+        {
+            let mut s = self.settings.write().unwrap();
+            if let Some(p) = new_controller {
+                warn!("port {controller} is reserved by the system; the core's controller moves to {p}");
+                s.controller_port = p;
+            }
+            if let Some(p) = new_mixed {
+                warn!("port {mixed} is reserved by the system; the proxy moves to {p}");
+                s.mixed_port = p;
+            }
+        }
+        drop(held);
+        if let Err(e) = self.save_settings() {
+            warn!("the new ports are used but not saved: {e}");
+        }
+    }
+
     fn build_config(&self, with_xray: bool, refused: &BTreeMap<String, String>) -> Result<config::Built> {
         let s = self.settings();
         // the free mode uses the core only to filter (ads now, the DPI engine later): no profile, no VPN
@@ -1869,7 +1936,7 @@ impl Manager {
         if s.adblock && self.ads_more_file().is_file() {
             built.yaml = config::with_more_ads(&built.yaml)?;
         }
-        // Supercell's games through the gaming DNS, direct, in every mode
+        // "Games": Roblox's pictures found, Supercell's games through the gaming DNS, direct, in every mode
         if s.games_dns {
             built.yaml = config::with_games(&built.yaml, &self.remote.doc().settings.game_sites, &crate::builtin::get().games_dns)?;
         }
@@ -2115,6 +2182,7 @@ impl Manager {
         *self.geodata_missing.lock().unwrap() = discover::ensure_geodata(&bin, &self.paths);
         self.log_ring.lock().unwrap().clear();
         self.stop_xray();
+        self.swap_reserved_ports();
         let built = self.build_and_sync_xray().await?;
         let r = self.launch_mihomo(&bin, &built).await;
         if r.is_err() {
@@ -2164,6 +2232,7 @@ impl Manager {
         }
         self.log_ring.lock().unwrap().clear();
         self.tun_on.store(true, SeqCst);
+        self.swap_reserved_ports();
         let result: Result<()> = async {
             // Xray is not part of the Android app (yet): mihomo runs every server
             let built = self.build_config(false, &BTreeMap::new())?;
@@ -2234,6 +2303,7 @@ impl Manager {
         self.log_ring.lock().unwrap().clear();
         self.stop_xray();
         self.tun_on.store(true, SeqCst);
+        self.swap_reserved_ports();
         let result = async {
             let built = self.build_and_sync_xray().await?;
             // Xray is a separate process and cannot use mihomo's physical
@@ -3206,6 +3276,8 @@ impl Manager {
             let old = g.clone();
             let mut next = old.clone();
             next.apply_patch(patch)?;
+            // The first-run marker is internal: patches may not turn it on or reset completed onboarding.
+            next.consent_fresh = old.consent_fresh && !next.onboarded;
             #[cfg(target_os = "macos")]
             if next.connected != old.connected { return Err(Error::msg("use connect or disconnect to change connection state")); }
             // Switching capture methods requires the current helper session
@@ -3252,6 +3324,11 @@ impl Manager {
         };
         new.save(&self.paths.settings_file())?;
         self.metrics.set_on(new.metrics);
+        if !old.consent_stats && new.consent_stats {
+            // A new install can report itself immediately even before it records its first measurement.
+            self.metrics.ensure_today();
+            self.spawn_initial_stats();
+        }
         // a running Telegram bridge picks up new Cloudflare domains at once
         if old.tg.cf_domains != new.tg.cf_domains && self.tg.lock().unwrap().is_some() {
             if let Err(e) = self.start_tg().await {
@@ -4116,6 +4193,65 @@ async fn wait_adapter(name: &str, total: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn first_run_marker_cannot_be_reenabled_by_a_settings_patch() {
+        let dir = std::env::temp_dir().join(format!("kometfy-consent-marker-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let manager = Manager::new(dir.clone(), Arc::new(|_, _| {})).unwrap();
+        assert!(manager.settings().consent_fresh);
+        manager.update_settings(json!({ "onboarded": true })).await.unwrap();
+        assert!(!manager.settings().consent_fresh);
+        manager.update_settings(json!({ "onboarded": false, "consent_fresh": true })).await.unwrap();
+        assert!(!manager.settings().consent_fresh);
+        drop(manager);
+        assert!(!Settings::load(&dir.join("settings.json")).consent_fresh);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn newly_consented_install_is_reported_without_waiting_for_the_periodic_tick() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = std::env::temp_dir().join(format!("kometfy-first-stats-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let manager = Manager::new(dir.clone(), Arc::new(|_, _| {})).unwrap();
+        manager.metrics.clear(); // A fresh install may have no daily samples yet.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        manager.update_settings(json!({ "backend_url": base })).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(100), listener.accept()).await.is_err());
+
+        manager.update_settings(json!({ "consent_stats": true })).await.unwrap();
+        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
+        let mut request = Vec::new();
+        let (header_end, body_len) = loop {
+            let mut buf = [0u8; 4096];
+            let n = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buf)).await.unwrap().unwrap();
+            assert!(n > 0, "request closed before the body arrived");
+            request.extend_from_slice(&buf[..n]);
+            if let Some(end) = request.windows(4).position(|v| v == b"\r\n\r\n") {
+                let head = std::str::from_utf8(&request[..end]).unwrap();
+                let len = head.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
+                }).unwrap();
+                if request.len() >= end + 4 + len {
+                    break (end + 4, len);
+                }
+            }
+        };
+        let head = std::str::from_utf8(&request[..header_end]).unwrap();
+        assert!(head.starts_with("POST /v1/stats "), "{head}");
+        let body: Value = serde_json::from_slice(&request[header_end..header_end + body_len]).unwrap();
+        assert_eq!(body["day"], crate::remote::today());
+        assert_eq!(body["counts"]["connects"], 0);
+        assert_eq!(body["counts"]["connect_ok"], 0);
+        assert_eq!(body["install"], manager.settings().install_id);
+        assert!(body["net"].is_null() && body["subs"].is_null());
+        socket.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn selecting_chain_from_old_profile_rebinds_only_if_all_hops_exist() {

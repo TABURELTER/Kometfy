@@ -2,7 +2,7 @@
 
 *English version below.*
 
-PrismRoute (Kometfy) — клиент для вашего собственного VPN или прокси. Учётных записей у проекта нет. У него есть свой сервер (бэкенд Kometfy на Cloudflare; его адрес в приложении зашифрован). С него программа берёт удалённые настройки и рекламу; запрос этот ничего о вас не сообщает. Статистику и итоги проверок сети программа отправляет туда **только с вашего согласия** на экране знакомства. Ответ можно поменять в любой момент: Настройки → Конфиденциальность. Ниже — всё, к чему программа обращается, и всё, что она хранит на вашем ПК.
+PrismRoute (Kometfy) — клиент для вашего собственного VPN или прокси. Учётных записей у проекта нет. У него есть свой сервер (бэкенд Kometfy на Cloudflare; его адрес в приложении зашифрован). С него программа берёт удалённые настройки и рекламу; запрос этот ничего о вас не сообщает. Статистику и итоги проверок сети программа отправляет туда **только после выбора на экране знакомства**. При первой установке пункты на экране предложены включёнными: можно выключить любой или продолжить без них; выбор сохраняется при завершении знакомства. Ответ можно поменять в любой момент: Настройки → Конфиденциальность. Ниже — всё, к чему программа обращается, и всё, что она хранит на вашем ПК.
 
 ## Куда программа обращается по сети
 
@@ -88,7 +88,7 @@ Android-версия (бета) делает то же самое, с таким
 
 # PrismRoute privacy (English)
 
-PrismRoute (Kometfy) is a client for your own VPN or proxy. The project has no accounts. Its own server (Kometfy's backend on Cloudflare; the app keeps its address veiled) hands out remote settings and ads; fetching them says nothing about you. Statistics and the results of network checks go there **only with your consent**, asked once on the welcome screen and changeable any time under Settings → Privacy.
+PrismRoute (Kometfy) is a client for your own VPN or proxy. The project has no accounts. Its own server (Kometfy's backend on Cloudflare; the app keeps its address veiled) hands out remote settings and ads; fetching them says nothing about you. Statistics and network check results are sent **only after you choose on the welcome screen**. On a first installation, the options are suggested on; you can turn off any of them or continue without them. Your selection is saved when you finish the welcome screen and can be changed any time under Settings → Privacy.
 
 ## Network requests
 

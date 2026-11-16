@@ -128,6 +128,8 @@ struct State {
     /// When each piece last went out (or was fetched); None = not yet since start.
     config_at: Option<Instant>,
     stats_at: Option<Instant>,
+    /// Last non-empty statistics attempt, including failures; limits retries separately from successful sends.
+    stats_attempt_at: Option<Instant>,
     tasks_at: Option<Instant>,
     /// Shown and pressed per (day, ad), since the last report.
     ads: HashMap<(String, String), (u32, u32)>,
@@ -137,6 +139,8 @@ pub struct Remote {
     file: PathBuf,
     http: reqwest::Client,
     state: Mutex<State>,
+    /// Periodic and manually requested ticks can overlap; only one may send statistics at a time.
+    stats_lock: tokio::sync::Mutex<()>,
     /// What picks an A/B variant: the install id once there is one, else a random one for this run (nothing is
     /// counted without the consent anyway).
     seed: Mutex<String>,
@@ -145,6 +149,7 @@ pub struct Remote {
 /// How often each piece goes: settings and ads for everyone, statistics and tests for those who agreed.
 pub const CONFIG_EVERY: Duration = Duration::from_secs(6 * 3600);
 pub const STATS_EVERY: Duration = Duration::from_secs(6 * 3600);
+const STATS_RETRY_EVERY: Duration = Duration::from_secs(10 * 60);
 pub const TASKS_EVERY: Duration = Duration::from_secs(4 * 3600);
 
 impl Remote {
@@ -159,7 +164,7 @@ impl Remote {
             .user_agent(concat!("Kometfy/", env!("CARGO_PKG_VERSION")))
             .build()
             .unwrap_or_default();
-        Self { file, http, state: Mutex::new(State { doc, ..Default::default() }), seed: Mutex::new(uuid::Uuid::new_v4().to_string()) }
+        Self { file, http, state: Mutex::new(State { doc, ..Default::default() }), stats_lock: tokio::sync::Mutex::new(()), seed: Mutex::new(uuid::Uuid::new_v4().to_string()) }
     }
 
     /// The settings and the ads as the UI shows them: one variant of each A/B test, the same every time.
@@ -193,7 +198,7 @@ impl Remote {
         let now = Some(Instant::now());
         match what {
             "config" => s.config_at = now,
-            "stats" => s.stats_at = now,
+            "stats" => { s.stats_at = now; s.stats_attempt_at = None; }
             _ => s.tasks_at = now,
         }
     }
@@ -271,10 +276,23 @@ impl Remote {
 
     /// `POST /v1/stats`: one body per day (yesterday's final totals and today's so far).
     pub async fn send_stats(&self, base: &str, bodies: &[Value]) -> Result<()> {
-        self.mark("stats");
+        if bodies.is_empty() {
+            return Ok(());
+        }
+        let Ok(_guard) = self.stats_lock.try_lock() else { return Ok(()) };
+        {
+            let mut s = self.state.lock().unwrap();
+            if s.stats_at.is_some_and(|t| t.elapsed() < STATS_EVERY)
+                || s.stats_attempt_at.is_some_and(|t| t.elapsed() < STATS_RETRY_EVERY)
+            {
+                return Ok(());
+            }
+            s.stats_attempt_at = Some(Instant::now());
+        }
         for b in bodies {
             self.post(&format!("{base}/v1/stats"), b).await?;
         }
+        self.mark("stats");
         Ok(())
     }
 
@@ -300,6 +318,10 @@ impl Remote {
         let mut s = self.state.lock().unwrap();
         s.config_at = None;
         s.stats_at = None;
+        // Do not erase an in-flight attempt: if it fails, automatic ticks still respect retry backoff.
+        if self.stats_lock.try_lock().is_ok() {
+            s.stats_attempt_at = None;
+        }
         s.tasks_at = None;
     }
 
@@ -464,6 +486,70 @@ pub fn checked(raw: &Value, base: &str) -> RemoteDoc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn statistics_retry_after_failure_but_not_empty_or_concurrently() {
+        use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::oneshot;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = requests.clone();
+        let (started, wait_started) = oneshot::channel();
+        let (release, wait_release) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut first = Some((started, wait_release));
+            for code in [503, 204, 503, 204, 204, 204] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0; 4096];
+                assert!(socket.read(&mut buf).await.unwrap() > 0);
+                server_requests.fetch_add(1, Ordering::SeqCst);
+                if let Some((started, release)) = first.take() {
+                    let _ = started.send(());
+                    release.await.unwrap();
+                }
+                let status = if code == 204 { "204 No Content" } else { "503 Service Unavailable" };
+                socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+            }
+        });
+        let r = Arc::new(Remote::new(std::env::temp_dir().join("kometfy-stats-retry-test.json")));
+        let bodies = vec![json!({"day": "first"}), json!({"day": "second"})];
+        r.send_stats(&base, &[]).await.unwrap();
+        assert!(r.due("stats", STATS_EVERY));
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+
+        let first = { let r = r.clone(); let base = base.clone(); let body = bodies[0].clone();
+            tokio::spawn(async move { r.send_stats(&base, &[body]).await }) };
+        wait_started.await.unwrap();
+        // An overlapping tick cannot start another HTTP request, even after a manual force.
+        r.force();
+        r.send_stats(&base, &bodies).await.unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        release.send(()).unwrap();
+        assert!(first.await.unwrap().is_err());
+
+        // A failed send is still due, but automatic retries are bounded to one every ten minutes.
+        assert!(r.due("stats", STATS_EVERY));
+        r.send_stats(&base, &bodies).await.unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        // Explicit force preserves the existing manual retry behavior. A partial failure stays due.
+        r.force();
+        assert!(r.send_stats(&base, &bodies).await.is_err());
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        assert!(r.due("stats", STATS_EVERY));
+        r.state.lock().unwrap().stats_attempt_at = Some(Instant::now() - STATS_RETRY_EVERY);
+        r.send_stats(&base, &bodies).await.unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 5);
+        assert!(!r.due("stats", STATS_EVERY));
+        r.send_stats(&base, &bodies).await.unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 5);
+        r.force();
+        r.send_stats(&base, &bodies[..1]).await.unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 6);
+        server.await.unwrap();
+    }
 
     #[test]
     fn an_ab_test_shows_one_variant_per_install_by_its_share() {
