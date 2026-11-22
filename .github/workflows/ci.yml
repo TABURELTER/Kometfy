@@ -1,4 +1,4 @@
-# The core's unit tests on the two desktop platforms the app ships for.
+# The core's unit tests on desktop and cross-compilation checks for Android & Android TV (arm64 + armv7).
 name: tests
 on:
   push:
@@ -18,3 +18,40 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p prism-connect --lib --locked
+
+  android:
+    name: test (android & android-tv)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android
+      - name: Build byedpi for Android arm64 & armv7
+        run: |
+          set -eu
+          ndk="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          clang="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+          mkdir -p target/android-byedpi
+          for target in aarch64-linux-android26 armv7a-linux-androideabi26; do
+            "$clang" --target="$target" -D_DEFAULT_SOURCE -Ithird_party/byedpi -std=c99 -O2 -Wno-unknown-attributes -fPIE -pie \
+              -o "target/android-byedpi/libbyedpi-$target.so" \
+              third_party/byedpi/packets.c third_party/byedpi/main.c third_party/byedpi/conev.c \
+              third_party/byedpi/proxy.c third_party/byedpi/desync.c third_party/byedpi/mpool.c third_party/byedpi/extend.c
+          done
+      - name: Compile prism-connect and test suite for Android arm64 & armv7
+        run: |
+          set -eu
+          ndk="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          bin="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$bin/aarch64-linux-android26-clang"
+          export CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER="$bin/armv7a-linux-androideabi26-clang"
+          export CC_aarch64_linux_android="$bin/aarch64-linux-android26-clang"
+          export AR_aarch64_linux_android="$bin/llvm-ar"
+          export CC_armv7_linux_androideabi="$bin/armv7a-linux-androideabi26-clang"
+          export AR_armv7_linux_androideabi="$bin/llvm-ar"
+          cargo test -p prism-connect --lib --no-run --locked --target aarch64-linux-android
+          cargo test -p prism-connect --lib --no-run --locked --target armv7-linux-androideabi
