@@ -327,8 +327,8 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             core_path: None,
-            mixed_port: 17897,
-            controller_port: 19097,
+            mixed_port: crate::channel::NOW.mixed_port,
+            controller_port: crate::channel::NOW.controller_port,
             secret: String::new(),
             allow_lan: false,
             ipv6: false,

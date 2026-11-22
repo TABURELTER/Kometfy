@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering::SeqCst},
+        atomic::{AtomicBool, AtomicU8, Ordering::SeqCst},
         Arc, Mutex, RwLock,
     },
     time::{Duration, Instant},
@@ -29,7 +29,7 @@ use crate::{
     happ,
     lan::{self, Lan},
     launch, logfile,
-    metrics::{self, Metrics, Sampler, Stage},
+    metrics::{self, Metrics, Sampler, Stage, Step},
     mihomo::{self, Core, LineSink},
     opener,
     paths::Paths,
@@ -56,6 +56,7 @@ const CONFLICT_PROCESSES: &[(&str, &str)] = &[
     ("verge-mihomo-alpha.exe", "Clash Verge core"),
     ("clash for windows.exe", "Clash for Windows"),
     ("flclash.exe", "FlClash"),
+    ("flclashx.exe", "FlClashX"),
     ("v2rayn.exe", "v2rayN"),
     ("nekoray.exe", "NekoRay"),
     ("nekobox.exe", "NekoBox"),
@@ -207,6 +208,8 @@ pub struct Manager {
     emit: Emitter,
     /// Serializes every operation that changes the core or the capture state.
     op: tokio::sync::Mutex<()>,
+    /// The operation under `op` and since when: a hang is counted and logged (watchdog.rs).
+    watch: crate::watchdog::Watch,
     log_ring: Arc<Mutex<VecDeque<String>>>,
     stream_tasks: Mutex<Vec<JoinHandle<()>>>,
     monitor: Mutex<Option<JoinHandle<()>>>,
@@ -254,6 +257,8 @@ pub struct Manager {
     android: Mutex<Option<Arc<dyn crate::android::AndroidVpn>>>,
     tg: Mutex<Option<crate::tgbridge::Bridge>>,
     tg_error: Mutex<Option<String>>,
+    /// How far the connection being made has got (a `metrics::Step`), for its failure's code.
+    connect_step: AtomicU8,
     /// Zapret's winws: hidden, killed with us, its output in the core log.
     zapret: Core,
     /// winws's own last lines: what it said when it quit.
@@ -477,6 +482,7 @@ impl Manager {
             stream_http: controller::stream_client(),
             emit,
             op: tokio::sync::Mutex::new(()),
+            watch: Default::default(),
             log_ring: Arc::new(Mutex::new(VecDeque::new())),
             stream_tasks: Mutex::new(Vec::new()),
             monitor: Mutex::new(None),
@@ -514,6 +520,7 @@ impl Manager {
             android: Mutex::new(None),
             tg: Mutex::new(None),
             tg_error: Mutex::new(None),
+            connect_step: AtomicU8::new(0),
             zapret: Core::default(),
             dpi_alive: AtomicBool::new(false),
             zapret_out: Arc::new(Mutex::new(VecDeque::new())),
@@ -545,6 +552,36 @@ impl Manager {
 
     pub fn metrics(&self) -> &Metrics {
         &self.metrics
+    }
+
+    /// The operation lock (`op`), with the operation watched for a hang while it is held.
+    async fn op_lock(&self, op: &'static str) -> crate::watchdog::OpGuard<'_> {
+        crate::watchdog::OpGuard::new(self.op.lock().await, &self.watch, op)
+    }
+
+    /// Every 5 s on a thread of its own (a stuck async runtime must not stop it): a hung operation is counted and
+    /// logged once, the errors the log saw go into the statistics per module, and the error journal is saved.
+    fn spawn_watchdog(self: &Arc<Self>) {
+        let me = Arc::downgrade(self);
+        let _ = std::thread::Builder::new().name("watchdog".into()).spawn(move || {
+            let mut ticks = 0u32;
+            loop {
+                std::thread::sleep(Duration::from_secs(5));
+                let Some(m) = me.upgrade() else { return };
+                if let Some((op, took)) = m.watch.check(crate::watchdog::HANG_AFTER) {
+                    let step = crate::metrics::Step::from_u8(m.connect_step.load(SeqCst));
+                    tracing::warn!("hang: {op} has run for {} s (connect step {step:?})", took.as_secs());
+                    m.metrics.hang(op);
+                }
+                for (module, n) in crate::journal::take_counts() {
+                    m.metrics.add(&format!("{}.{module}", crate::metrics::name::LOG_ERROR), n);
+                }
+                ticks += 1;
+                if ticks % 6 == 0 {
+                    crate::journal::save(&m.paths.root);
+                }
+            }
+        });
     }
 
     /// Android: hand over the host's VPN service. Connecting is not possible before this.
@@ -740,7 +777,7 @@ impl Manager {
     /// The helper died while it was wanted: start it again with the same config, but not in a
     /// loop. Servers behind it do not work in the meantime, the others do.
     async fn revive_xray(self: &Arc<Self>) {
-        let _g = self.op.lock().await;
+        let _g = self.op_lock("revive_xray").await;
         if self.xray.pid().is_some() || !self.expected_running.load(SeqCst) {
             return;
         }
@@ -786,9 +823,27 @@ impl Manager {
         *self.last_error.lock().unwrap() = Some(e.to_string());
     }
 
+    fn step(&self, step: Step) {
+        self.connect_step.store(step as u8, SeqCst);
+    }
+
     fn log_tail(&self, n: usize) -> String {
         let r = self.log_ring.lock().unwrap();
         r.iter().rev().take(n).rev().cloned().collect::<Vec<_>>().join("\n")
+    }
+
+    /// Surface an app-level error (e.g. macOS helper failure before the core starts) in the Logs view.
+    fn push_log(&self, level: &str, msg: impl AsRef<str>) {
+        let clean = msg.as_ref().replace(['\r', '\n'], " ").replace('"', "'");
+        let line = format!("time=\"{}\" level={level} msg=\"{clean}\"", chrono::Utc::now().to_rfc3339());
+        {
+            let mut r = self.log_ring.lock().unwrap();
+            r.push_back(line.clone());
+            while r.len() > LOG_RING {
+                r.pop_front();
+            }
+        }
+        (self.emit)("core-logs", Value::Array(vec![parse_log(&line)]));
     }
 
     /// The core's log lines go to the ring and to the window. A busy core logs every connection, and on Android
@@ -1052,6 +1107,7 @@ impl Manager {
             ("State", state),
             ("Statistics (kept on this PC only)", diagnostics::metrics_text(&self.metrics.summary(30))),
             ("Core log (last 80 lines; lines that name sites are left out)", diagnostics::core_log(&core_lines)),
+            ("Frequent errors and warnings (the error journal)", crate::journal::report(30)),
             ("App log (last 150 lines)", diagnostics::scrub(&app_log)),
         ];
         let text = diagnostics::assemble(&sections);
@@ -1063,6 +1119,7 @@ impl Manager {
 
     /// App start: begin crash monitoring, then auto-connect / auto-start per settings.
     pub async fn startup(self: &Arc<Self>, connect_now: bool) {
+        self.spawn_watchdog();
         self.spawn_monitor();
         self.spawn_remote();
         #[cfg(target_os = "macos")]
@@ -1131,7 +1188,7 @@ impl Manager {
                     let free = s.app_mode == crate::settings::AppMode::FreeAntiDpi;
                     let lists = (s.games_dns && before.game_sites != after.game_sites) || (free && s.ai_access && before.ai_sites != after.ai_sites);
                     if lists && self.running() {
-                        let _g = self.op.lock().await;
+                        let _g = self.op_lock("remote_tick").await;
                         if let Err(e) = self.reload_locked().await {
                             warn!("remote lists: {e}");
                         }
@@ -1252,6 +1309,8 @@ impl Manager {
                 let d = self.metrics.day_totals(&day)?;
                 let c = |k: &str| d.counts.get(k).copied().unwrap_or(0);
                 let failed = |kind: &str| c(&format!("{}.{kind}", crate::metrics::name::CONNECT_FAILED));
+                // failed connections by their codes (`core.not_ready`: 2), a fixed list and never an error's text
+                let errors = crate::metrics::errors_for_stats(&d.counts);
                 Some(json!({
                     "install": s.install_id,
                     "platform": std::env::consts::OS,
@@ -1267,6 +1326,7 @@ impl Manager {
                         "fail_subscription": failed("subscription"),
                         "crashes": c(crate::metrics::name::APP_CRASH),
                     },
+                    "errors": errors,
                     "cpu_p95": d.cpu_p95,
                     "mem_p95": d.mem_p95,
                     "cpu_p50": if described { json!(d.cpu_p50) } else { Value::Null },
@@ -1474,7 +1534,7 @@ impl Manager {
     /// Stop the core and give up the ports before another process (elevated relaunch) takes over.
     /// Returns whether the user was connected, so a cancelled relaunch can restore that.
     pub async fn release(self: &Arc<Self>) -> Result<bool> {
-        let _g = self.op.lock().await;
+        let _g = self.op_lock("release").await;
         #[cfg(target_os = "macos")]
         if self.handoff_prepared() { return Err(Error::msg("an exit or update is already in progress")); }
         let was_connected = self.settings().connected;
@@ -1490,7 +1550,7 @@ impl Manager {
     /// Cancel a prepared update or relaunch and return the state to restore.
     #[cfg(target_os = "macos")]
     pub async fn cancel_handoff(&self) -> Option<(bool, bool)> {
-        let _g = self.op.lock().await;
+        let _g = self.op_lock("cancel_handoff").await;
         self.handoff.lock().unwrap().take()
     }
 
@@ -1501,7 +1561,7 @@ impl Manager {
     /// This does not enable capture while the preview gate is in place.
     #[cfg(target_os = "macos")]
     pub(crate) async fn attach_proxy_guard(&self, guard: Arc<crate::macos_proxy_session::GuardSession>) -> Result<()> {
-        let _operation = self.op.lock().await;
+        let _operation = self.op_lock("attach_proxy_guard").await;
         if self.handoff_prepared() || self.recovery_required.load(SeqCst) {
             return Err(Error::msg("proxy recovery or app exit is in progress"));
         }
@@ -1543,7 +1603,7 @@ impl Manager {
             let guard_installed = installed("/Library/PrivilegedHelperTools/dev.prismroute.proxy-guard")?;
             let bridge_installed = installed("/Library/PrivilegedHelperTools/dev.prismroute.proxy-bridge")?;
             match (guard_installed, bridge_installed) {
-                (false, false) => crate::macos_installer_client::install_from_bundle()?,
+                (false, false) | (true, false) | (false, true) => crate::macos_installer_client::install_from_bundle()?,
                 (true, true) => {
                     let guard_pin = option_env!("PRISM_GUARD_SHA256").ok_or("guard build pin is not configured")?;
                     let bridge_pin = option_env!("PRISM_BRIDGE_SHA256").ok_or("bridge build pin is not configured")?;
@@ -1557,7 +1617,6 @@ impl Manager {
                         crate::macos_installer_client::install_from_bundle()?;
                     }
                 },
-                _ => return Err("macOS helper installation is incomplete; repair is required".into()),
             }
             crate::macos_proxy_session::GuardSession::open_native(Duration::from_secs(10))
         })
@@ -1646,7 +1705,7 @@ impl Manager {
 
     /// Retry recovery without stopping a still-running core.
     pub async fn retry_proxy_recovery(&self) -> Result<()> {
-        let _g = self.op.lock().await;
+        let _g = self.op_lock("retry_proxy_recovery").await;
         let result = self.restore_proxy_for_stop().await;
         self.emit_state();
         result
@@ -1805,7 +1864,7 @@ impl Manager {
     }
 
     async fn handle_core_exit(self: &Arc<Self>) {
-        let _g = self.op.lock().await;
+        let _g = self.op_lock("handle_core_exit").await;
         let running = self.core.pid().is_some();
         #[cfg(target_os = "macos")]
         let orphaned_proxy = !self.recovery_required.load(SeqCst) && self.proxy_guard_orphaned();
@@ -2121,7 +2180,7 @@ impl Manager {
         if cfg!(windows) || !s.connected || vpn_on(&s) {
             return;
         }
-        let _g = self.op.lock().await;
+        let _g = self.op_lock("reroute_dpi").await;
         if let Err(e) = self.reload_locked().await {
             warn!("dpi route: {e}");
         }
@@ -2195,19 +2254,18 @@ impl Manager {
     async fn launch_mihomo(self: &Arc<Self>, bin: &Path, built: &config::Built) -> Result<()> {
         let cfg = self.paths.runtime_config();
         crate::util::write_atomic(&cfg, built.yaml.as_bytes())?;
+        self.step(Step::Check);
         self.validate(bin, &cfg).await?;
         *self.build_info.lock().unwrap() = built.info.clone();
+        self.step(Step::Launch);
         let pid = self.core.start(bin, &self.paths.runtime_dir(), &cfg, self.sink())?;
         info!("mihomo started, pid {pid}");
+        self.step(Step::Ready);
         // generous: the core downloads rule/proxy providers before it opens the controller
         if !self.controller().wait_ready(Duration::from_secs(40)).await {
             let tail = self.log_tail(8);
             self.core.stop();
-            return Err(Error::msg(if tail.is_empty() {
-                "core did not become ready".to_string()
-            } else {
-                mihomo::summarize_error(&tail)
-            }));
+            return Err(Error::msg(mihomo::not_ready(&tail, 40)));
         }
         self.expected_running.store(true, SeqCst);
         self.spawn_streams();
@@ -2245,13 +2303,16 @@ impl Manager {
             let yaml = config::configure_android_tun(only.as_deref().unwrap_or(&built.yaml), fd)?;
             let cfg = self.paths.runtime_config();
             crate::util::write_atomic(&cfg, yaml.as_bytes())?;
+            self.step(Step::Check);
             self.validate(&bin, &cfg).await?;
             *self.build_info.lock().unwrap() = built.info.clone();
+            self.step(Step::Launch);
             let pid = self.core.start_with_fd(&bin, &self.paths.runtime_dir(), &cfg, self.sink(), fd)?;
             info!("mihomo started with the VPN tunnel, pid {pid}");
+            self.step(Step::Ready);
             if !self.controller().wait_ready(Duration::from_secs(40)).await {
                 let tail = self.log_tail(8);
-                return Err(Error::msg(if tail.is_empty() { "core did not become ready".to_string() } else { mihomo::summarize_error(&tail) }));
+                return Err(Error::msg(mihomo::not_ready(&tail, 40)));
             }
             self.expected_running.store(true, SeqCst);
             self.spawn_streams();
@@ -2471,7 +2532,7 @@ impl Manager {
     }
 
     pub async fn start_core(self: &Arc<Self>) -> Result<()> {
-        let _g = self.op.lock().await;
+        let _g = self.op_lock("start_core").await;
         let r = self.start_core_locked().await;
         if let Err(e) = &r {
             self.set_error(e);
@@ -2481,7 +2542,7 @@ impl Manager {
     }
 
     pub async fn stop_core(self: &Arc<Self>) -> Result<()> {
-        let _g = self.op.lock().await;
+        let _g = self.op_lock("stop_core").await;
         self.stop_core_locked().await?;
         self.resume_zapret().await;
         self.emit_state();
@@ -2508,7 +2569,7 @@ impl Manager {
     }
 
     pub async fn restart_core(self: &Arc<Self>) -> Result<()> {
-        let _g = self.op.lock().await;
+        let _g = self.op_lock("restart_core").await;
         let r = self.restart_locked().await;
         if let Err(e) = &r {
             self.set_error(e);
@@ -2682,8 +2743,8 @@ impl Manager {
 
     pub async fn connect(self: &Arc<Self>) -> Result<()> {
         let began = Instant::now();
-        // set once the core runs and only the capture (system proxy / TUN) is left
-        let capturing = AtomicBool::new(false);
+        // how far it gets: the failure's code says where it stopped
+        self.step(Step::Prepare);
         #[allow(unreachable_code)]
         let r = async {
             // Authorization can show a system dialog and attaching the guard
@@ -2697,7 +2758,7 @@ impl Manager {
                     self.prepare_macos_proxy_guard().await?;
                 }
             }
-            let _g = self.op.lock().await;
+            let _g = self.op_lock("connect").await;
             #[cfg(target_os = "macos")]
             self.ensure_macos_preview_can_connect()?;
             #[cfg(all(target_os = "macos", feature = "macos-native-bridge"))]
@@ -2713,7 +2774,7 @@ impl Manager {
             #[cfg(target_os = "android")]
             {
                 self.connect_android_locked().await?;
-                capturing.store(true, SeqCst);
+                self.step(Step::Capture);
                 self.settings.write().unwrap().connected = true;
                 self.save_settings()?;
                 *self.last_error.lock().unwrap() = None;
@@ -2727,7 +2788,7 @@ impl Manager {
                 return Err(Error::NeedAdmin);
             }
             self.start_core_locked().await?;
-            capturing.store(true, SeqCst);
+            self.step(Step::Capture);
             self.apply_method_locked().await?;
             self.settings.write().unwrap().connected = true;
             self.save_settings()?;
@@ -2746,8 +2807,13 @@ impl Manager {
                 self.metrics.millis(metrics::name::CONNECT_MS, began.elapsed());
             }
             Err(e) => {
-                let stage = if capturing.load(SeqCst) { Stage::Capture } else { Stage::Start };
-                self.metrics.failed(metrics::name::CONNECT_FAILED, metrics::classify(stage, e));
+                let step = Step::from_u8(self.connect_step.load(SeqCst));
+                let kind = metrics::classify(if step == Step::Capture { Stage::Capture } else { Stage::Start }, e);
+                let code = metrics::code(kind, step, e);
+                // the whole text stays in the local log; the statistics get the code only
+                warn!("connect failed ({code}): {e}");
+                self.push_log("error", format!("connect failed ({code}): {e}"));
+                self.metrics.connect_failed(kind, code);
             }
         }
         if let Err(e) = &r {
@@ -2761,7 +2827,7 @@ impl Manager {
 
     #[cfg_attr(target_os = "android", allow(unreachable_code))]
     pub async fn disconnect(self: &Arc<Self>) -> Result<()> {
-        let _g = self.op.lock().await;
+        let _g = self.op_lock("disconnect").await;
         #[cfg(target_os = "android")]
         {
             self.disconnect_android_locked().await?;
@@ -3266,7 +3332,7 @@ impl Manager {
     // ---------------------------------------------------------------- settings
 
     pub async fn update_settings(self: &Arc<Self>, patch: Value) -> Result<()> {
-        let _g = self.op.lock().await;
+        let _g = self.op_lock("update_settings").await;
         #[cfg(target_os = "macos")]
         if self.handoff_prepared() || self.recovery_required.load(SeqCst) {
             return Err(Error::msg("proxy recovery or app exit is in progress"));
@@ -3409,7 +3475,7 @@ impl Manager {
     // ---------------------------------------------------------------- core install
 
     pub async fn install_core(self: &Arc<Self>, from: Option<String>) -> Result<()> {
-        let _g = self.op.lock().await;
+        let _g = self.op_lock("install_core").await;
         let src = match from {
             Some(p) => PathBuf::from(p),
             None => self
@@ -3439,7 +3505,7 @@ impl Manager {
 
     /// Download the official mihomo release, verify it and install it. Emits `core-download` progress.
     pub async fn download_core(self: &Arc<Self>) -> Result<String> {
-        let _g = self.op.lock().await;
+        let _g = self.op_lock("download_core").await;
         // while connected, GitHub may only be reachable through our own proxy
         let via = self
             .running()
@@ -3553,7 +3619,7 @@ impl Manager {
 
     /// Download the official Xray release, verify it and install it. Emits `core-download` progress.
     pub async fn download_xray(self: &Arc<Self>) -> Result<String> {
-        let _g = self.op.lock().await;
+        let _g = self.op_lock("download_xray").await;
         let via = self.download_proxy();
         let rel = match coredl::latest_of(Kind::Xray, None).await {
             Ok(r) => r,
@@ -3589,7 +3655,7 @@ impl Manager {
 
     /// Use an `xray.exe` the user points to: it is copied into the app folder.
     pub async fn install_xray(self: &Arc<Self>, from: String) -> Result<()> {
-        let _g = self.op.lock().await;
+        let _g = self.op_lock("install_xray").await;
         let src = PathBuf::from(from);
         if !src.is_file() {
             return Err(Error::msg("core file not found"));
@@ -3712,14 +3778,25 @@ impl Manager {
     }
 
     pub async fn select_profile(self: &Arc<Self>, id: &str) -> Result<()> {
-        let _g = self.op.lock().await;
+        let _g = self.op_lock("select_profile").await;
         if self.profiles.lock().unwrap().get(id).is_none() {
             return Err(Error::msg("profile not found"));
         }
-        let previous = self.settings.write().unwrap().active_profile.replace(id.to_string());
+        let (previous, prev_app_mode) = {
+            let mut g = self.settings.write().unwrap();
+            let prev_mode = g.app_mode;
+            // Explicitly picking a subscription while in Free mode leaves Free mode so the core actually loads
+            // the subscription's servers instead of reloading with an empty proxy list.
+            if g.app_mode == crate::settings::AppMode::FreeAntiDpi {
+                g.app_mode = crate::settings::AppMode::SmartHybridVpn;
+            }
+            (g.active_profile.replace(id.to_string()), prev_mode)
+        };
         let r = self.reload_locked().await;
         if let Err(e) = &r {
-            self.settings.write().unwrap().active_profile = previous;
+            let mut g = self.settings.write().unwrap();
+            g.active_profile = previous;
+            g.app_mode = prev_app_mode;
             self.set_error(e);
         }
         self.save_settings()?;
@@ -3728,14 +3805,26 @@ impl Manager {
     }
 
     pub async fn update_profile(self: &Arc<Self>, id: &str) -> Result<ProfileMeta> {
-        let url = {
+        let (url, existing_nodes) = {
             let store = self.profiles.lock().unwrap();
             let p = store.get(id).ok_or_else(|| Error::msg("profile not found"))?;
-            p.url.clone().ok_or_else(|| Error::msg("local profiles have nothing to update"))?
+            (
+                p.url.clone().ok_or_else(|| Error::msg("local profiles have nothing to update"))?,
+                p.nodes,
+            )
         };
         let f = self.fetch_subscription(&url).await?;
         let norm = subscription::normalize(&f.body)?;
-        config::build(Some(&norm.yaml), None, &self.settings(), &[], false)?;
+        let built = config::build(Some(&norm.yaml), None, &self.settings(), &[], false)?;
+        if existing_nodes > 0 && norm.nodes == 0 && built.info.proxy_count == 0 {
+            let has_providers = serde_yaml::from_str::<serde_yaml::Value>(&norm.yaml)
+                .ok()
+                .and_then(|v| v.get("proxy-providers").and_then(|p| p.as_mapping()).map(|m| !m.is_empty()))
+                .unwrap_or(false);
+            if !has_providers {
+                return Err(Error::msg("subscription returned no servers; kept the existing list"));
+            }
+        }
         let remote_title = f.title.clone().or_else(|| f.filename.clone());
         let (meta, changed) = {
             let mut store = self.profiles.lock().unwrap();
@@ -3758,7 +3847,7 @@ impl Manager {
             (out, changed)
         };
         if changed && self.settings().active_profile.as_deref() == Some(id) {
-            let _g = self.op.lock().await;
+            let _g = self.op_lock("update_profile").await;
             if let Err(e) = self.reload_locked().await {
                 self.set_error(&e);
             }
@@ -3804,7 +3893,7 @@ impl Manager {
     }
 
     pub async fn remove_profile(self: &Arc<Self>, id: &str) -> Result<()> {
-        let _g = self.op.lock().await;
+        let _g = self.op_lock("remove_profile").await;
         self.profiles.lock().unwrap().remove(id)?;
         let was_active = self.settings().active_profile.as_deref() == Some(id);
         if was_active {
@@ -3891,7 +3980,7 @@ impl Manager {
             store.save_index()?;
         }
         if self.settings().active_profile.as_deref() == Some(id) {
-            let _g = self.op.lock().await;
+            let _g = self.op_lock("write_profile").await;
             if let Err(e) = self.reload_locked().await {
                 let _ = self.profiles.lock().unwrap().write(id, &old);
                 self.emit_state();
@@ -3929,7 +4018,7 @@ impl Manager {
     /// Replace the user's rule list. A list the core refuses is rolled back, so a typo in a regex
     /// can never leave the app without a working config.
     pub async fn set_rules(self: &Arc<Self>, list: Vec<UserRule>) -> Result<Vec<UserRule>> {
-        let _g = self.op.lock().await;
+        let _g = self.op_lock("set_rules").await;
         let previous = self.rules.lock().unwrap().items().to_vec();
         let saved = self.rules.lock().unwrap().replace(list)?;
         if let Err(e) = self.apply_config_locked().await {
@@ -3945,7 +4034,7 @@ impl Manager {
     // ---------------------------------------------------------------- chains
 
     pub async fn save_chain(self: &Arc<Self>, mut c: Chain) -> Result<Chain> {
-        let _g = self.op.lock().await;
+        let _g = self.op_lock("save_chain").await;
         if c.profile.is_none() {
             c.profile = self.settings().active_profile;
         }
@@ -3958,7 +4047,7 @@ impl Manager {
     }
 
     pub async fn remove_chain(self: &Arc<Self>, id: &str) -> Result<()> {
-        let _g = self.op.lock().await;
+        let _g = self.op_lock("remove_chain").await;
         self.chains.lock().unwrap().remove(id)?;
         if let Err(e) = self.reload_locked().await {
             self.set_error(&e);
@@ -3970,7 +4059,7 @@ impl Manager {
     /// Route default traffic through the chain: pick it in the chains group and point the main
     /// selector groups (and GLOBAL) at that group.
     pub async fn activate_chain(self: &Arc<Self>, id: &str) -> Result<()> {
-        let _operation = self.op.lock().await;
+        let _operation = self.op_lock("activate_chain").await;
         let chain = self
             .chains
             .lock()
@@ -4335,6 +4424,25 @@ mod tests {
         assert_eq!(m.settings().app_mode, AppMode::FreeAntiDpi);
         m.import_profile("vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls&type=tcp#t", None).await.unwrap();
         assert_eq!(m.settings().app_mode, AppMode::SmartHybridVpn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn selecting_a_profile_leaves_free_mode_and_loads_servers() {
+        use crate::settings::AppMode;
+        let dir = std::env::temp_dir().join(format!("kometfy-select-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let m = Manager::new(dir.clone(), Arc::new(|_, _| {})).unwrap();
+        let meta = m
+            .import_profile("vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls&type=tcp#Node1", None)
+            .await
+            .unwrap();
+        m.update_settings(serde_json::json!({ "app_mode": "FreeAntiDPI" })).await.unwrap();
+        assert_eq!(m.settings().app_mode, AppMode::FreeAntiDpi);
+        m.select_profile(&meta.id).await.unwrap();
+        assert_eq!(m.settings().app_mode, AppMode::SmartHybridVpn);
+        let built = m.build_config(false, &BTreeMap::new()).unwrap();
+        assert_eq!(built.info.proxy_count, 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 

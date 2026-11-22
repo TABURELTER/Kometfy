@@ -27,17 +27,52 @@ fn same_plist(actual: &[u8], expected: &[u8]) -> bool {
     matches!((parse(actual), parse(expected)), (Ok(a), Ok(b)) if a == b)
 }
 
+/// Accept either an exact match with this build's plist or an earlier Kometfy/PrismRoute plist for the same
+/// label and helper executable, so future plist changes upgrade cleanly without touching third-party daemons.
+fn owned_plist(actual: &[u8], expected: &[u8], label: &str, program: &str) -> bool {
+    if same_plist(actual, expected) { return true; }
+    let Ok(plist::Value::Dictionary(map)) = plist::Value::from_reader(std::io::Cursor::new(actual)) else { return false };
+    let same_label = map.get("Label").and_then(plist::Value::as_string) == Some(label);
+    let same_program = map
+        .get("ProgramArguments")
+        .and_then(plist::Value::as_array)
+        .and_then(|arr| arr.first())
+        .and_then(plist::Value::as_string)
+        == Some(program);
+    same_label && same_program
+}
+
 fn verify_installed_signatures() -> Result<(), String> {
     for path in ["/Library/PrivilegedHelperTools/dev.prismroute.proxy-guard", "/Library/PrivilegedHelperTools/dev.prismroute.proxy-bridge"] {
         let status = Command::new("/usr/bin/codesign").args(["--verify", "--strict", path]).env_clear()
             .status().map_err(|e| format!("cannot verify installed helper: {e}"))?;
-        if !status.success() { return Err("existing helper signature is invalid".into()); }
+        if !status.success() { return Err("installed helper signature is invalid".into()); }
     }
     Ok(())
 }
 
-fn rollback_update(helpers: &Directory, state: &Directory, old_guard: &[u8], old_bridge: &[u8], old_policy: &[u8], new_policy: &[u8]) -> io::Result<()> {
-    for (dir, slot, old, new) in [(helpers, Slot::Guard, old_guard, GUARD), (helpers, Slot::Bridge, old_bridge, BRIDGE), (state, Slot::ClientPolicy, old_policy, new_policy)] {
+fn read_optional_slot(dir: &Directory, slot: Slot) -> Result<Option<Vec<u8>>, String> {
+    match dir.read_slot(slot) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("existing helper file is untrusted: {e}")),
+    }
+}
+
+fn rollback_update(
+    helpers: &Directory, daemons: &Directory, state: &Directory,
+    old_guard: Option<&[u8]>, old_bridge: Option<&[u8]>,
+    old_recovery_plist: Option<&[u8]>, old_bridge_plist: Option<&[u8]>,
+    old_policy: Option<&[u8]>, new_policy: &[u8],
+) -> io::Result<()> {
+    for (dir, slot, old, new) in [
+        (helpers, Slot::Guard, old_guard, GUARD),
+        (helpers, Slot::Bridge, old_bridge, BRIDGE),
+        (daemons, Slot::RecoveryPlist, old_recovery_plist, RECOVERY_PLIST),
+        (daemons, Slot::BridgePlist, old_bridge_plist, BRIDGE_PLIST),
+        (state, Slot::ClientPolicy, old_policy, new_policy),
+    ] {
+        let Some(old) = old else { continue };
         let current = dir.read_slot(slot)?;
         if current == old { continue; }
         if current != new { return Err(io::Error::other("updated file changed externally; retained for recovery")); }
@@ -46,19 +81,33 @@ fn rollback_update(helpers: &Directory, state: &Directory, old_guard: &[u8], old
     Ok(())
 }
 
-fn upgrade(helpers: &Directory, daemons: &Directory, state: &Directory, lock: &GuardLock,
-           old_guard: Vec<u8>, old_bridge: Vec<u8>, old_policy: Vec<u8>, identity: &str) -> Result<(), String> {
-    if !valid_policy(&old_policy) { return Err("existing client policy is invalid".into()); }
-    let recovery_plist = daemons.read_slot(Slot::RecoveryPlist).map_err(|e| format!("cannot inspect recovery service: {e}"))?;
-    let bridge_plist = daemons.read_slot(Slot::BridgePlist).map_err(|e| format!("cannot inspect bridge service: {e}"))?;
-    if !same_plist(&recovery_plist, RECOVERY_PLIST) || !same_plist(&bridge_plist, BRIDGE_PLIST) {
-        return Err("existing service configuration is different; update refused".into());
+fn upgrade_or_repair(
+    helpers: &Directory, daemons: &Directory, state: &Directory, lock: &GuardLock,
+    old_guard: Option<Vec<u8>>, old_bridge: Option<Vec<u8>>,
+    old_recovery_plist: Option<Vec<u8>>, old_bridge_plist: Option<Vec<u8>>,
+    old_policy: Option<Vec<u8>>, identity: &str,
+) -> Result<(), String> {
+    if let Some(ref plist) = old_recovery_plist {
+        if !owned_plist(plist, RECOVERY_PLIST, "dev.prismroute.proxy-recovery", "/Library/PrivilegedHelperTools/dev.prismroute.proxy-guard") {
+            return Err("existing recovery service configuration belongs to another program; update refused".into());
+        }
     }
-    verify_installed_signatures()?;
+    if let Some(ref plist) = old_bridge_plist {
+        if !owned_plist(plist, BRIDGE_PLIST, "dev.prismroute.proxy-bridge", "/Library/PrivilegedHelperTools/dev.prismroute.proxy-bridge") {
+            return Err("existing bridge service configuration belongs to another program; update refused".into());
+        }
+    }
     let mut controller = Controller::new(LaunchctlRunner, lock);
+    // Allows absent/unloaded services (e.g. after a crashed update or downgrade) while still
+    // refusing any foreign loaded service under our labels.
     controller.verify_existing().map_err(str::to_owned)?;
-    let backup = state.retain_backup(&[(Slot::Guard, &old_guard), (Slot::Bridge, &old_bridge),
-        (Slot::ClientPolicy, &old_policy), (Slot::RecoveryPlist, &recovery_plist), (Slot::BridgePlist, &bridge_plist)])
+    let mut backup_entries: Vec<(Slot, &[u8])> = Vec::new();
+    if let Some(ref b) = old_guard { backup_entries.push((Slot::Guard, b)); }
+    if let Some(ref b) = old_bridge { backup_entries.push((Slot::Bridge, b)); }
+    if let Some(ref b) = old_policy { backup_entries.push((Slot::ClientPolicy, b)); }
+    if let Some(ref b) = old_recovery_plist { backup_entries.push((Slot::RecoveryPlist, b)); }
+    if let Some(ref b) = old_bridge_plist { backup_entries.push((Slot::BridgePlist, b)); }
+    let backup = state.retain_backup(&backup_entries)
         .map_err(|e| format!("cannot preserve previous helper version: {e}"))?;
     if let Err(error) = controller.stop_existing() {
         // Do not replace files while a stop is uncertain. Best-effort restart
@@ -69,27 +118,68 @@ fn upgrade(helpers: &Directory, daemons: &Directory, state: &Directory, lock: &G
             Err(restart) => Err(format!("could not stop existing services: {error}; service recovery failed: {restart}; previous files retained in {backup}")),
         };
     }
+    controller.ensure_enabled().map_err(str::to_owned)?;
+    let mut tx = Transaction::new(lock);
     let update = (|| {
-        helpers.replace_slot(Slot::Guard, &old_guard, GUARD)?;
-        helpers.replace_slot(Slot::Bridge, &old_bridge, BRIDGE)?;
-        state.replace_slot(Slot::ClientPolicy, &old_policy, identity.as_bytes())?;
+        for (dir, slot, old, new) in [
+            (helpers, Slot::Guard, old_guard.as_deref(), GUARD),
+            (helpers, Slot::Bridge, old_bridge.as_deref(), BRIDGE),
+            (daemons, Slot::RecoveryPlist, old_recovery_plist.as_deref(), RECOVERY_PLIST),
+            (daemons, Slot::BridgePlist, old_bridge_plist.as_deref(), BRIDGE_PLIST),
+            (state, Slot::ClientPolicy, old_policy.as_deref(), identity.as_bytes()),
+        ] {
+            match old {
+                Some(prev) if prev == new => {}
+                Some(prev) => dir.replace_slot(slot, prev, new)?,
+                None => tx.publish(dir, slot, new)?,
+            }
+        }
         Ok::<_, io::Error>(())
     })();
     if let Err(error) = update {
-        let restored = rollback_update(helpers, state, &old_guard, &old_bridge, &old_policy, identity.as_bytes())
+        let _ = tx.rollback();
+        let restored = rollback_update(
+            helpers, daemons, state,
+            old_guard.as_deref(), old_bridge.as_deref(),
+            old_recovery_plist.as_deref(), old_bridge_plist.as_deref(),
+            old_policy.as_deref(), identity.as_bytes(),
+        )
             .map_err(|e| format!("cannot restore previous files: {e}"))
             .and_then(|_| controller.start_existing().map_err(str::to_owned));
-        return match restored { Ok(()) => Err(format!("helper update failed and previous version was restored: {error}")),
-            Err(restore) => Err(format!("helper update failed: {error}; {restore}; previous files retained in {backup}")) };
+        return match restored {
+            Ok(()) => Err(format!("helper update failed and previous version was restored: {error}")),
+            Err(restore) => Err(format!("helper update failed: {error}; {restore}; previous files retained in {backup}")),
+        };
+    }
+    // Verify the NEWLY installed helpers before registering them with launchd (never block
+    // replacing a broken older helper from an earlier build).
+    if let Err(error) = verify_installed_signatures() {
+        let _ = tx.rollback();
+        let _ = rollback_update(
+            helpers, daemons, state,
+            old_guard.as_deref(), old_bridge.as_deref(),
+            old_recovery_plist.as_deref(), old_bridge_plist.as_deref(),
+            old_policy.as_deref(), identity.as_bytes(),
+        );
+        return Err(error);
     }
     if let Err(error) = controller.register() {
         if !error.safe_to_remove_files { return Err(format!("helper restart outcome uncertain: {}; previous files retained in {backup}", error.reason)); }
-        let restored = rollback_update(helpers, state, &old_guard, &old_bridge, &old_policy, identity.as_bytes())
+        let _ = tx.rollback();
+        let restored = rollback_update(
+            helpers, daemons, state,
+            old_guard.as_deref(), old_bridge.as_deref(),
+            old_recovery_plist.as_deref(), old_bridge_plist.as_deref(),
+            old_policy.as_deref(), identity.as_bytes(),
+        )
             .map_err(|e| format!("cannot restore previous files: {e}"))
             .and_then(|_| controller.start_existing().map_err(str::to_owned));
-        return match restored { Ok(()) => Err(format!("helper restart failed and previous version was restored: {}", error.reason)),
-            Err(restore) => Err(format!("helper restart failed: {}; {restore}; previous files retained in {backup}", error.reason)) };
+        return match restored {
+            Ok(()) => Err(format!("helper restart failed and previous version was restored: {}", error.reason)),
+            Err(restore) => Err(format!("helper restart failed: {}; {restore}; previous files retained in {backup}", error.reason)),
+        };
     }
+    let _ = tx.commit();
     Ok(())
 }
 
@@ -147,19 +237,18 @@ pub fn run_installer() -> Result<(), String> {
     let identity = client_identity(pid)?;
     let (helpers, daemons, state) = Directory::provision_system_directories().map_err(|e| format!("cannot provision helper directories: {e}"))?;
     let lock = GuardLock::acquire(&state).map_err(|e| format!("cannot acquire helper lock: {e}"))?;
-    let guard = helpers.read_slot(Slot::Guard);
-    let bridge = helpers.read_slot(Slot::Bridge);
-    let policy = state.read_slot(Slot::ClientPolicy);
-    match (guard, bridge, policy) {
-        (Ok(guard), Ok(bridge), Ok(policy)) => {
-            upgrade(&helpers, &daemons, &state, &lock, guard, bridge, policy, &identity)?;
-            register_session_right();
-            return Ok(());
-        }
-        (Err(a), Err(b), Err(c)) if [a.kind(), b.kind(), c.kind()].iter().all(|kind| *kind == io::ErrorKind::NotFound) => {},
-        _ => return Err("existing helper installation is incomplete or untrusted; update refused".into()),
+    let guard = read_optional_slot(&helpers, Slot::Guard)?;
+    let bridge = read_optional_slot(&helpers, Slot::Bridge)?;
+    let recovery_plist = read_optional_slot(&daemons, Slot::RecoveryPlist)?;
+    let bridge_plist = read_optional_slot(&daemons, Slot::BridgePlist)?;
+    let policy = read_optional_slot(&state, Slot::ClientPolicy)?;
+    if guard.is_some() || bridge.is_some() || recovery_plist.is_some() || bridge_plist.is_some() || policy.is_some() {
+        upgrade_or_repair(&helpers, &daemons, &state, &lock, guard, bridge, recovery_plist, bridge_plist, policy, &identity)?;
+        register_session_right();
+        return Ok(());
     }
     let mut controller = Controller::new(LaunchctlRunner, &lock);
+    controller.ensure_enabled().map_err(str::to_owned)?;
     controller.preflight().map_err(str::to_owned)?;
     let mut tx = Transaction::new(&lock);
     let published = (|| {

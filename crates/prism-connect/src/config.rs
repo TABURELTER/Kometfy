@@ -592,35 +592,51 @@ pub fn with_more_ads(yaml: &str) -> Result<String> {
     Ok(serde_yaml::to_string(&root)?)
 }
 
-/// The free route to AI services: a free public HTTP proxy, which lets through only the domains on its list. These
-/// are the AI ones of that list, taken on 13 November 2026.
+/// The free route to AI services: a free public HTTP proxy, which lets through only the domains on its list (its full
+/// PAC file; the short "free" one dropped the AI services on 20 November 2026 while the proxy still lets them through).
+/// These are the AI ones of the full list, with Google's sign-in and the internal APIs its AI apps call, taken on
+/// 20 November 2026: AI Studio broke without `*.clients6.google.com`, the account pages and three `-pa` APIs.
+/// Left out on purpose though the list has them: `googleapis.com`, `gstatic.com`, `googleusercontent.com` and
+/// `www.google.com` as a whole. Through one shared free proxy they would take YouTube's API, Android's Play services,
+/// Chrome's updates and Google search (with its captchas for shared addresses). The backend's `ai_sites` adds names
+/// without a release when a service needs more.
 /// shortcut: a fixed copy of the proxy's list; read its PAC file at run time if the list changes often.
 /// The proxies themselves come from the app build (`builtin::Builtin::ai_proxies`), not from this source.
 const AI_GROUP: &str = "Kometfy AI";
-pub const AI_SITES: [&str; 70] = [
+pub const AI_SITES: [&str; 112] = [
     // OpenAI
-    "openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com", "oaistatsig.com", "sora.com",
-    "chatgpt.livekit.cloud", "openai-api.arkoselabs.com", "openaicom.imgix.net", "featuregates.org",
-    "statsig.com", "statsigapi.net",
+    "openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com", "oaistatsig.com", "sora.com", "livekit.cloud",
+    "openai-api.arkoselabs.com", "openaicom.imgix.net", "featuregates.org", "statsig.com", "statsigapi.net",
     // Anthropic
     "anthropic.com", "claude.ai", "claude.com", "claudeusercontent.com",
-    // Google
-    "gemini.google.com", "gemini.google", "aistudio.google.com", "ai.google.dev", "generativelanguage.googleapis.com",
-    "alkalimakersuite-pa.clients6.google.com", "alkalicore-pa.clients6.google.com",
-    "alkalimetricsink-pa.clients6.google.com", "webchannel-alkalimakersuite-pa.clients6.google.com",
-    "aisandbox-pa.googleapis.com", "content-aisandbox-pa.googleapis.com", "cloudcode-pa.googleapis.com",
-    "content-cloudcode-pa.googleapis.com", "notebooklm.google.com", "notebooklm.google", "notebooklm-pa.googleapis.com",
-    "labs.google", "jules.google.com", "bard.google.com", "proactivebackend-pa.googleapis.com",
-    "robinfrontend-pa.googleapis.com", "monospace-pa.clients6.google.com", "idx.google.com",
-    "colab.research.google.com", "opal.google",
+    // Google: the AI apps and their APIs
+    "gemini.google.com", "gemini.google", "aistudio.google.com", "google.dev", "generativelanguage.googleapis.com",
+    "clients6.google.com", "aisandbox-pa.googleapis.com", "content-aisandbox-pa.googleapis.com",
+    "cloudcode-pa.googleapis.com", "content-cloudcode-pa.googleapis.com", "notebooklm.google.com", "notebooklm.google",
+    "notebook.google.com", "notebook.google", "notebooklm-pa.googleapis.com", "labs.google", "withgoogle.com",
+    "jules.google.com", "bard.google.com", "proactivebackend-pa.googleapis.com", "robinfrontend-pa.googleapis.com",
+    "appcatalyst.pa.googleapis.com", "developerprofiles-pa.googleapis.com", "subscriptionsfirstparty-pa.googleapis.com",
+    "idx.google.com", "colab.research.google.com", "opal.google", "learning.google.com", "cloud.google.com",
+    "console.cloud.google.com",
+    // Google: the account they sign in with (a page through the proxy and its sign-in direct would not agree)
+    "accounts.google.com", "ogs.google.com", "myaccount.google.com", "apis.google.com", "consent.google.com",
+    "lh3.google.com",
     // xAI, Microsoft, GitHub
     "x.ai", "grok.com", "grokusercontent.com", "copilot.microsoft.com", "copilot.com", "sydney.bing.com",
-    "githubcopilot.com", "copilot-proxy.githubusercontent.com", "designer.microsoft.com",
-    // editors and other services
-    "cursor.com", "api2.cursor.sh", "prod.authentication.cursor.sh", "codeium.com", "windsurf.com", "deepl.com",
-    "elevenlabs.io", "openrouter.ai", "groq.com", "cloud.cerebras.ai", "api.cerebras.ai", "genspark.ai",
-    "manus.im", "t3.chat", "duck.ai", "jetbrains.ai", "api.app.prod.grazie.aws.intellij.net", "factory.ai",
-    "recraft.ai", "jina.ai",
+    "edgeservices.bing.com", "speech.platform.bing.com", "login.live.com", "githubcopilot.com",
+    "copilot-proxy.githubusercontent.com", "designer.microsoft.com", "designerapp.officeapps.live.com",
+    "designerapp.osi.office.net",
+    // editors and agents
+    "cursor.com", "api2.cursor.sh", "api3.cursor.sh", "agent.api5.cursor.sh", "agentn.api5.cursor.sh",
+    "agent.global.api5.cursor.sh", "agentn.global.api5.cursor.sh", "prod.authentication.cursor.sh", "codeium.com",
+    "windsurf.com", "jetbrains.ai", "account.jetbrains.com", "api.app.prod.grazie.aws.intellij.net", "trae.ai",
+    "traecdn.ai", "marscode.com", "marscoding.com", "trae-api-sg.mchost.guru", "kilo.ai", "kilocode.ai",
+    "app.cline.bot", "docs.cline.bot", "factory.ai",
+    // other AI services
+    "deepl.com", "elevenlabs.io", "openrouter.ai", "groq.com", "cloud.cerebras.ai", "api.cerebras.ai", "genspark.ai",
+    "manus.im", "t3.chat", "duck.ai", "recraft.ai", "jina.ai", "hedra.com", "lightning.ai", "reve.art", "app.reve.com",
+    "assemblyai.com", "deepgram.com", "granola.ai", "granola.so", "granola.club", "openevidence.com",
+    "ai-chat.bsg.brave.com",
 ];
 /// Supercell's games through a gaming DNS: it answers
 /// the names of the game servers with its own relays, which reach Supercell from Russia and Belarus, and every
@@ -683,9 +699,25 @@ pub fn with_games(yaml: &str, extra: &[String], servers: &[String]) -> Result<St
     Ok(serde_yaml::to_string(&root)?)
 }
 
+/// The rest of what the AI proxy carries, with the AI services: the services that closed for Russia (Notion, Canva,
+/// Adobe, Figma, the antiviruses' updates...). Written from the proxy's full PAC by scripts/proxy-sites.mjs, less the
+/// names that stay off a shared proxy (Google as a whole, Windows' updates, big CDNs, telemetry); one name per line,
+/// each with the names under it.
+const PROXY_SITES: &str = include_str!("proxy_sites.txt");
+
+/// The names of [`PROXY_SITES`].
+pub fn proxy_sites() -> impl Iterator<Item = &'static str> {
+    PROXY_SITES.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#'))
+}
+
 /// The built-in list and the remote one (docs/BACKEND.md: it only adds), each name once.
 fn merged(builtin: &[&str], extra: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = builtin.iter().map(|d| d.to_string()).collect();
+    let mut out: Vec<String> = Vec::with_capacity(builtin.len() + extra.len());
+    for d in builtin {
+        if !out.iter().any(|o| o == d) {
+            out.push(d.to_string());
+        }
+    }
     for d in extra {
         if !out.contains(d) {
             out.push(d.clone());
@@ -695,8 +727,8 @@ fn merged(builtin: &[&str], extra: &[String]) -> Vec<String> {
 }
 
 /// What the proxy's list sends direct although it is under a name above (big downloads, a forum that refuses
-/// data-centre addresses).
-const AI_DIRECT: [&str; 2] = ["community.openai.com", "downloads.cursor.com"];
+/// data-centre addresses, Google's Antigravity, which the proxy's owner sends direct).
+const AI_DIRECT: [&str; 3] = ["community.openai.com", "downloads.cursor.com", "antigravity.google"];
 
 /// Send AI services through the AI proxy, just above the final catch-all rule (and above the free mode's
 /// QUIC rule: their QUIC is refused, so browsers fall back to TCP, which an HTTP proxy carries).
@@ -712,7 +744,8 @@ pub fn with_ai(yaml: &str, extra: &[String], proxies: &[String]) -> Result<Strin
     if proxies.is_empty() {
         return Ok(yaml.to_string());
     }
-    let sites = merged(&AI_SITES, extra);
+    let builtin: Vec<&str> = AI_SITES.iter().copied().chain(proxy_sites()).collect();
+    let sites = merged(&builtin, extra);
     let mut root: Mapping = serde_yaml::from_str(yaml)?;
     ensure_seq(&mut root, "proxies");
     ensure_seq(&mut root, "proxy-groups");
@@ -826,7 +859,10 @@ pub fn build_all(
     ensure_seq(&mut root, "rules");
 
     let proxy_names = names_of(&root, "proxies");
-    let has_providers = root.contains_key("proxy-providers");
+    let has_providers = root
+        .get("proxy-providers")
+        .and_then(Value::as_mapping)
+        .is_some_and(|m| !m.is_empty());
     if proxy_names.is_empty() && !has_providers {
         root.insert(k("proxy-groups"), Value::Sequence(vec![]));
         root.insert(k("rules"), strs(["MATCH,DIRECT"]));
@@ -1084,6 +1120,13 @@ mod tests {
         assert!(out.contains("+.chatgpt.com") && out.contains("proxy.example") && out.contains("Kometfy AI 2") && out.contains("8080"));
         // every name is a plain domain
         assert!(AI_SITES.iter().all(|d| crate::zapret::clean_domain(d).as_deref() == Some(*d)));
+        // the closed services ride along, the names that stay off the shared proxy do not
+        assert!(out.contains("+.notion.so") && out.contains("+.canva.com"));
+        assert!(proxy_sites().count() > 100 && proxy_sites().all(|d| crate::zapret::clean_domain(d).as_deref() == Some(d)));
+        for off in ["googleapis.com", "gstatic.com", "googleusercontent.com", "www.google.com", "windowsupdate.com", "githubusercontent.com"] {
+            assert!(!proxy_sites().any(|d| d == off || d.ends_with(&format!(".{off}"))), "{off} stays off the proxy");
+        }
+        assert!(!out.contains("+.googleapis.com") && out.contains("+.generativelanguage.googleapis.com"));
     }
 
     #[test]
@@ -1425,6 +1468,14 @@ rules:
         assert_eq!(names_of(&m, "proxy-groups"), vec!["PROXY".to_string()]);
         let rules = m.get("rules").and_then(Value::as_sequence).unwrap();
         assert_eq!(rules.last().and_then(Value::as_str), Some("MATCH,PROXY"));
+    }
+
+    #[test]
+    fn empty_proxy_providers_still_generates_default_groups() {
+        let y = "proxies:\n  - {name: A, type: socks5, server: 1.1.1.1, port: 1}\nproxy-providers: {}\n";
+        let b = build(Some(y), None, &settings(), &[], false).unwrap();
+        let m = parse(&b);
+        assert_eq!(names_of(&m, "proxy-groups"), vec!["PROXY".to_string()]);
     }
 
     #[test]

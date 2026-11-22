@@ -90,7 +90,21 @@ int prism_macos_install_helper(const char *source, const char *expected, char *o
         if (run_system_tool(auth, "/usr/bin/install", args) != 0) { AuthorizationFree(auth, 0); return -3; }
     }
     if (!trusted_directory("/Library/PrivilegedHelperTools")) { AuthorizationFree(auth, 0); return -3; }
-    if (lstat(destination, &meta) != 0) {
+    if (lstat(destination, &meta) == 0) {
+        /* A previous interrupted install may have left an older build's temporary installer.
+         * Replace it only if it is a safe root-owned regular file; fail closed on symlinks or foreign files. */
+        if (!verified_protected_installer(expected)) {
+            if (!S_ISREG(meta.st_mode) || meta.st_uid != 0 || meta.st_nlink != 1 || (meta.st_mode & 0022)) {
+                AuthorizationFree(auth, 0); return -3;
+            }
+            if (remove_temporary_installer(auth) != 0) { AuthorizationFree(auth, 0); return -3; }
+            char *args[] = {"-m", "755", (char *)source, (char *)destination, NULL};
+            created = 1;
+            if (run_system_tool(auth, "/usr/bin/install", args) != 0) {
+                (void)remove_temporary_installer(auth); AuthorizationFree(auth, 0); return -3;
+            }
+        }
+    } else {
         if (errno != ENOENT) { AuthorizationFree(auth, 0); return -3; }
         char *args[] = {"-m", "755", (char *)source, (char *)destination, NULL};
         created = 1;

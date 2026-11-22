@@ -295,6 +295,12 @@ fn count_proxies(root: &Mapping) -> usize {
         .unwrap_or(0)
 }
 
+fn has_proxy_providers(root: &Mapping) -> bool {
+    root.get("proxy-providers")
+        .and_then(Value::as_mapping)
+        .is_some_and(|m| !m.is_empty())
+}
+
 /// Turn whatever the user pasted or the server returned into a Clash profile.
 pub fn normalize(body: &str) -> Result<Normalized> {
     normalize_depth(body, 0)
@@ -313,8 +319,12 @@ fn normalize_depth(body: &str, depth: u8) -> Result<Normalized> {
 
     if let Ok(Value::Mapping(root)) = serde_yaml::from_str::<Value>(text) {
         if root.contains_key("proxies") || root.contains_key("proxy-providers") {
+            let nodes = count_proxies(&root);
+            if nodes == 0 && !has_proxy_providers(&root) {
+                return Err(Error::msg("subscription returned no servers"));
+            }
             return Ok(Normalized {
-                nodes: count_proxies(&root),
+                nodes,
                 yaml: text.to_string(),
                 source: Source::Clash,
                 warnings: vec![],
@@ -498,5 +508,13 @@ mod tests {
     #[test]
     fn garbage_rejected() {
         assert!(normalize("hello world").is_err());
+    }
+
+    #[test]
+    fn empty_clash_proxies_are_rejected() {
+        assert!(normalize("proxies: []\nrules:\n  - MATCH,DIRECT\n").is_err());
+        assert!(normalize("proxies:\nproxy-providers: {}\n").is_err());
+        // A valid non-empty proxy-providers map is still allowed even without inline proxies.
+        assert!(normalize("proxy-providers:\n  sub:\n    type: http\n    url: https://example.com/p.yaml\n").is_ok());
     }
 }

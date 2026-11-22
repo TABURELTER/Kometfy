@@ -190,8 +190,9 @@ void load_cache(struct mphdr *hdr, FILE *in, struct desync_params *dp)
         
         int bitlen;
         uint16_t port;
-        time_t cache_time;
-        
+        // Kometfy patch: %jd writes an intmax_t (8 bytes), and time_t is 4 bytes on 32-bit Android: read it whole
+        intmax_t cache_time;
+
         int c = fscanf(in, "0 %39s %d %hu %jd %255s\n", 
             addr_str, &bitlen, &port, &cache_time, host);
         if (c < 1) {
@@ -229,7 +230,7 @@ void load_cache(struct mphdr *hdr, FILE *in, struct desync_params *dp)
             free(data);
             return;
         }
-        e->time = cache_time;
+        e->time = (time_t)cache_time;
         e->extra_len = strlen(host);
         e->dp = dp;
         

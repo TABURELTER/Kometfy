@@ -84,10 +84,14 @@ pub struct AdVariant {
     pub ad: Box<RemoteAd>,
 }
 
+/// A ready banner in a wide (computer) and a narrow (phone) size; at least one. The app shows the one that fits its
+/// slot, and leaves the ad out where neither does (a desktop-only banner on a phone).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Banner {
-    pub wide: String,
-    pub narrow: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wide: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub narrow: Option<String>,
 }
 
 fn one() -> u32 {
@@ -369,7 +373,8 @@ pub fn pick(doc: &RemoteDoc, seed: &str) -> RemoteDoc {
         .ads
         .iter()
         .map(|a| {
-            let b = bucket(seed, &a.id);
+            let base = a.id.split_once('.').map_or(a.id.as_str(), |(id, _)| id);
+            let b = bucket(seed, base);
             let mut acc = 0;
             for v in &a.variants {
                 acc += v.share;
@@ -430,7 +435,10 @@ pub fn checked(raw: &Value, base: &str) -> RemoteDoc {
     let color = |v: Option<&Value>| v.and_then(Value::as_str).filter(|c| c.len() == 7 && c.starts_with('#') && c[1..].chars().all(|x| x.is_ascii_hexdigit())).map(str::to_string);
     let asset = |v: Option<&Value>| v.and_then(Value::as_str).filter(|k| k.len() == 64 && k.chars().all(|c| c.is_ascii_hexdigit())).map(|k| format!("{base}/v1/assets/{k}"));
     let face = |a: &Value, id: String| -> Option<RemoteAd> {
-        let banner = a.get("banner").and_then(|b| Some(Banner { wide: asset(b.get("wide"))?, narrow: asset(b.get("narrow"))? }));
+        let banner = a
+            .get("banner")
+            .map(|b| Banner { wide: asset(b.get("wide")), narrow: asset(b.get("narrow")) })
+            .filter(|b| b.wide.is_some() || b.narrow.is_some());
         let button = a.get("button").filter(|b| b.is_object()).map(|b| {
             json!({
                 "bg": color(b.get("bg")),
@@ -461,18 +469,25 @@ pub fn checked(raw: &Value, base: &str) -> RemoteDoc {
         .flatten()
         .take(20)
         .filter_map(|a| {
-            let id = text(a.get("id"), 40).filter(|i| i.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))?;
-            let mut ad = face(a, id.clone())?;
-            // B, C, D with their shares; A keeps at least 1%
+            let base_id = text(a.get("id"), 40).filter(|i| i.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))?;
+            // When variant A is filtered out for this platform, the backend serves the matching variant
+            // as primary with `"variant": "b"|"c"|"d"` so counts still attribute to that variant.
+            let primary_variant = a.get("variant").and_then(Value::as_str).filter(|k| matches!(*k, "b" | "c" | "d"));
+            let primary_id = match primary_variant {
+                Some(k) => format!("{base_id}.{k}"),
+                None => base_id.clone(),
+            };
+            let mut ad = face(a, primary_id)?;
+            // B, C, D with their shares; the primary keeps at least 1%
             let mut total = 0;
             for v in a.get("variants").and_then(Value::as_array).into_iter().flatten().take(3) {
                 let key = v.get("key").and_then(Value::as_str).filter(|k| matches!(*k, "b" | "c" | "d"));
                 let share = v.get("share").and_then(Value::as_u64).filter(|s| (1..=99).contains(s)).map(|s| s as u32);
                 let (Some(key), Some(share)) = (key, share) else { continue };
-                if total + share > 99 || ad.variants.iter().any(|x| x.key == key) {
+                if primary_variant == Some(key) || total + share > 99 || ad.variants.iter().any(|x| x.key == key) {
                     continue;
                 }
-                if let Some(face) = face(v, format!("{id}.{key}")) {
+                if let Some(face) = face(v, format!("{base_id}.{key}")) {
                     total += share;
                     ad.variants.push(AdVariant { key: key.to_string(), share, ad: Box::new(face) });
                 }
@@ -571,6 +586,23 @@ mod tests {
         // the same install, the same variant
         assert_eq!(pick(&doc, "one").ads[0].id, pick(&doc, "one").ads[0].id);
         assert!(pick(&doc, "one").ads[0].variants.is_empty());
+
+        // When variant A is filtered out on a platform (e.g. A is Android-only, B is Windows-only),
+        // the backend sends B as the primary with `"variant": "b"` so stats still attribute to B.
+        let win_only = json!({
+            "ads": [{
+                "id": "vpn-1a2b3c",
+                "variant": "b",
+                "name": "VPN",
+                "text": "Windows B",
+                "color": "#8f9bff",
+                "url": "https://example.com/b"
+            }]
+        });
+        let doc_win = checked(&win_only, "https://backend.example");
+        assert_eq!(doc_win.ads.len(), 1);
+        assert_eq!(doc_win.ads[0].id, "vpn-1a2b3c.b");
+        assert_eq!(pick(&doc_win, "win-install").ads[0].id, "vpn-1a2b3c.b");
     }
 
     #[test]
@@ -600,6 +632,20 @@ mod tests {
         assert_eq!(d.ads.len(), 1);
         assert_eq!(d.ads[0].bg.as_deref(), Some(format!("https://backend.example/v1/assets/{key}").as_str()));
         assert_eq!(d.ads[0].weight, 100);
+    }
+
+    #[test]
+    fn a_banner_may_come_in_one_size_and_a_bad_size_is_dropped() {
+        let key = "b".repeat(64);
+        let ad = |banner: Value| json!({ "ads": [{ "id": "x", "name": "X", "color": "#000000", "url": "https://example.com", "banner": banner }] });
+        let d = checked(&ad(json!({ "wide": key })), "https://backend.example");
+        let b = d.ads[0].banner.as_ref().unwrap();
+        assert_eq!((b.wide.as_deref(), b.narrow.as_deref()), (Some(format!("https://backend.example/v1/assets/{key}").as_str()), None));
+        // a size that is not a picture's key is dropped; no size at all is no banner
+        let d = checked(&ad(json!({ "wide": "../etc", "narrow": key })), "https://backend.example");
+        assert!(d.ads[0].banner.as_ref().unwrap().wide.is_none());
+        let d = checked(&ad(json!({ "wide": "nope" })), "https://backend.example");
+        assert!(d.ads[0].banner.is_none());
     }
 
     #[test]

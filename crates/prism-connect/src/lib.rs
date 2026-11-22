@@ -7,6 +7,10 @@
 pub mod android;
 pub mod builtin;
 pub mod chain;
+pub mod channel;
+pub mod reset;
+pub mod journal;
+pub mod watchdog;
 pub mod config;
 pub mod controller;
 pub mod coredl;
@@ -70,8 +74,8 @@ mod macos_helper_payload;
 #[cfg(any(target_os = "macos", all(test, unix)))]
 #[allow(dead_code)] // Internal installer primitive; no system installer uses it yet.
 mod macos_installer_fs;
-#[cfg(any(target_os = "macos", all(test, unix)))]
-#[allow(dead_code)] // Fake-runner tested; no real launchctl adapter is installed.
+#[cfg(any(target_os = "macos", test))]
+#[allow(dead_code)] // Fake-runner tested on all hosts; real launchctl adapter used on macOS.
 mod macos_installer_services;
 #[cfg(any(target_os = "macos", all(test, unix)))]
 #[allow(dead_code)] // Not connected to an installer.

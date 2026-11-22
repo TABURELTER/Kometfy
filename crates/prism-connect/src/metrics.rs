@@ -33,6 +33,8 @@ pub mod name {
     pub const CONNECT_ATTEMPTS: &str = "connect_attempts";
     pub const CONNECT_OK: &str = "connect_ok";
     pub const CONNECT_FAILED: &str = "connect_failed";
+    /// A failed connection by its code (see [`super::code`]): `connect_error.core.not_ready`.
+    pub const CONNECT_ERROR: &str = "connect_error";
     pub const TUN_FAILED: &str = "tun_start_failed";
     pub const RELOAD_OK: &str = "config_reload_ok";
     pub const RELOAD_FAILED: &str = "config_reload_failed";
@@ -46,6 +48,35 @@ pub mod name {
     /// Processor load as `top` shows it: one core fully busy is 100. (The old `cpu_percent` was a share of the
     /// whole machine, so an app burning a whole core of eight read as 12%.)
     pub const CPU_PCT: &str = "cpu_core_percent";
+    /// A hang, by what hung (watchdog.rs): `hang.connect`, `hang.main` (the main thread), `hang.ui` (the interface).
+    pub const HANG: &str = "hang";
+    /// How long the main thread or the interface did not answer.
+    pub const MAIN_STALL_MS: &str = "main_stall_ms";
+    pub const UI_STALL_MS: &str = "ui_stall_ms";
+    /// Errors the log saw, per module (journal.rs): `log_error.manager`.
+    pub const LOG_ERROR: &str = "log_error";
+}
+
+/// The day's failures as the statistics send them (`errors`): codes and counts from fixed lists, never a message.
+/// `core.not_ready` (a failed connection by its code), `hang.connect` (what hung), `log.manager` (errors the log saw
+/// in a module).
+pub fn errors_for_stats(counts: &std::collections::BTreeMap<String, u64>) -> serde_json::Map<String, serde_json::Value> {
+    let connect = format!("{}.", name::CONNECT_ERROR);
+    let hang = format!("{}.", name::HANG);
+    let log = format!("{}.", name::LOG_ERROR);
+    counts
+        .iter()
+        .filter_map(|(k, n)| {
+            let key = if let Some(code) = k.strip_prefix(&connect) {
+                code.to_string()
+            } else if k.starts_with(&hang) {
+                k.clone()
+            } else {
+                format!("log.{}", k.strip_prefix(&log)?)
+            };
+            Some((key, serde_json::json!(n)))
+        })
+        .collect()
 }
 
 // Upper bounds of the histogram buckets (a last bucket takes everything above).
@@ -222,6 +253,70 @@ fn classify_text(stage: Stage, text: &str) -> Fail {
     }
 }
 
+/// How far a connection got before it failed. With the error's text it gives the failure's code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Step {
+    /// The core, its config and the Xray helper: before the core is checked.
+    Prepare = 0,
+    /// The core checks the config (`mihomo -t`).
+    Check = 1,
+    /// The core process is started.
+    Launch = 2,
+    /// Waiting for the core's controller.
+    Ready = 3,
+    /// The core runs: turning on the system proxy or TUN.
+    Capture = 4,
+}
+
+impl Step {
+    pub fn from_u8(v: u8) -> Step {
+        match v {
+            1 => Step::Check,
+            2 => Step::Launch,
+            3 => Step::Ready,
+            4 => Step::Capture,
+            _ => Step::Prepare,
+        }
+    }
+}
+
+/// A failure's code for the statistics: its kind and a reason from this fixed list, never the error's text, which
+/// can name a server, a file of the user's or an address. `core.not_ready`, `network.timeout`, `app.capture`...
+pub fn code(fail: Fail, step: Step, e: &Error) -> &'static str {
+    let text = e.to_string().to_lowercase();
+    let has = |words: &[&str]| words.iter().any(|w| text.contains(w));
+    match fail {
+        Fail::Network if has(&["timed out", "timeout"]) => "network.timeout",
+        Fail::Network if has(&["dns"]) => "network.dns",
+        Fail::Network if has(&["refused"]) => "network.refused",
+        Fail::Network if has(&["reset", "connection closed"]) => "network.reset",
+        Fail::Network if has(&["tls", "certificate"]) => "network.tls",
+        Fail::Network => "network.other",
+        Fail::Subscription if matches!(e, Error::Yaml(_)) || has(&["not a profile", "yaml"]) => "subscription.format",
+        Fail::Subscription if has(&["no servers"]) => "subscription.empty",
+        Fail::Subscription if has(&["401", "403", "404", "forbidden", "device", "limit"]) => "subscription.refused",
+        Fail::Subscription => "subscription.other",
+        Fail::Core if has(&["address already in use", "only one usage of each socket address", "os error 10048"]) => "core.port",
+        Fail::Core if has(&["wintun", "tun device", "tun adapter", "tun interface"]) => "core.tun",
+        Fail::Core if has(&["geoip", "geosite", "mmdb", "geodata"]) => "core.geodata",
+        Fail::Core if has(&["rule lists", "initial provider"]) => "core.providers",
+        Fail::Core if has(&["xray"]) => "core.xray",
+        Fail::Core => match step {
+            Step::Check => "core.config",
+            Step::Launch => "core.launch",
+            Step::Ready => "core.not_ready",
+            _ => "core.other",
+        },
+        Fail::App if step == Step::Capture => "app.capture",
+        Fail::App if matches!(e, Error::Io(_) | Error::Json(_)) => "app.files",
+        Fail::App => "app.other",
+        Fail::User if matches!(e, Error::NeedAdmin) => "user.admin",
+        Fail::User if matches!(e, Error::CoreMissing) => "user.no_core",
+        Fail::User => "user.other",
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct Stat {
     pub n: u64,
@@ -325,6 +420,21 @@ impl Metrics {
         if kind != Fail::User {
             self.event(base, kind.as_str());
         }
+    }
+
+    /// A failed connection: counted by its kind and by its code (see [`code`]); the recent events keep the code.
+    pub fn connect_failed(&self, kind: Fail, code: &str) {
+        self.count(&format!("{}.{}", name::CONNECT_FAILED, kind.as_str()));
+        self.count(&format!("{}.{code}", name::CONNECT_ERROR));
+        if kind != Fail::User {
+            self.event(name::CONNECT_FAILED, code);
+        }
+    }
+
+    /// Something hung (watchdog.rs): counted by what, and kept in the recent events.
+    pub fn hang(&self, what: &str) {
+        self.count(&format!("{}.{what}", name::HANG));
+        self.event(name::HANG, what);
     }
 
     pub fn event(&self, kind: &str, detail: &str) {
@@ -646,6 +756,20 @@ mod tests {
     }
 
     #[test]
+    fn a_failure_gets_a_code_from_the_list_and_never_its_text() {
+        let m = |t: &str| Error::msg(t);
+        let core = |step: Step, t: &str| code(classify(if step == Step::Capture { Stage::Capture } else { Stage::Start }, &m(t)), step, &m(t));
+        assert_eq!(core(Step::Ready, "the core was still downloading its rule lists after 40 s"), "core.providers");
+        assert_eq!(core(Step::Ready, "core did not become ready in 40 s"), "core.not_ready");
+        assert_eq!(core(Step::Check, "proxy 'my-server.example': unsupported cipher"), "core.config");
+        assert_eq!(core(Step::Ready, "listen tcp 127.0.0.1:7890: bind: Only one usage of each socket address"), "core.port");
+        assert_eq!(core(Step::Capture, "failed to set the system proxy"), "app.capture");
+        assert_eq!(core(Step::Ready, "dial tcp 1.2.3.4:443: i/o timeout"), "network.timeout");
+        assert_eq!(code(Fail::User, Step::Prepare, &Error::NeedAdmin), "user.admin");
+        assert_eq!(code(classify(Stage::Subscription, &m("HTTP 403 Forbidden")), Step::Prepare, &m("HTTP 403 Forbidden")), "subscription.refused");
+    }
+
+    #[test]
     fn children_are_found_at_every_depth_and_only_under_the_root() {
         // 10 is the app; 11 its WebView2 browser with 12 and 13 under it; 20 is someone else's
         let pairs = [(10, 1), (11, 10), (12, 11), (13, 11), (20, 1), (21, 20)];
@@ -822,5 +946,29 @@ mod tests {
         }
         #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
         assert!(me.is_none());
+    }
+}
+
+#[cfg(test)]
+mod stats_errors_tests {
+    use super::*;
+
+    #[test]
+    fn the_statistics_get_codes_hangs_and_module_errors_and_nothing_else() {
+        let counts: std::collections::BTreeMap<String, u64> = [
+            ("connect_error.core.not_ready", 2),
+            ("hang.connect", 1),
+            ("hang.ui", 3),
+            ("log_error.manager", 5),
+            ("connect_attempts", 9),
+            ("app_start", 4),
+        ]
+        .into_iter()
+        .map(|(k, n)| (k.to_string(), n))
+        .collect();
+        let e = errors_for_stats(&counts);
+        let keys: Vec<&str> = e.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["core.not_ready", "hang.connect", "hang.ui", "log.manager"]);
+        assert_eq!(e["log.manager"], 5);
     }
 }

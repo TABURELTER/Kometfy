@@ -86,7 +86,7 @@ fn recovery_service_ready(plist_bytes: &[u8], service: &str, disabled: &str) -> 
     let unique = |expected: &str| lines.iter().filter(|line| **line == expected).count() == 1;
     if !unique(&format!("system/{RECOVERY_LABEL} = {{")) || !unique(&format!("path = {RECOVERY_PLIST}"))
         || !unique(&format!("program = {RECOVERY_EXECUTABLE}")) || !unique("type = LaunchDaemon")
-        || !unique("run interval = 15 seconds") { return false; }
+        || !(unique("run interval = 15 seconds") || unique("start interval = 15 seconds")) { return false; }
     let Some(i) = lines.iter().position(|line| *line == "arguments = {") else { return false };
     if lines.get(i + 1..i + 4) != Some(&[RECOVERY_EXECUTABLE, "--recover-only", "}"][..]) { return false; }
     let mut disabled_lines = disabled.lines().map(str::trim);

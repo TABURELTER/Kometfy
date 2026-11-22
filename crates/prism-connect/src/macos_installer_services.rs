@@ -2,6 +2,7 @@
 //! process runner. The caller must keep the guard lock and file transaction
 //! alive until service verification or rollback finishes. Power loss, SIGKILL,
 //! lingering runner children, and privileged administrators need separate recovery.
+#[cfg(any(target_os = "macos", unix))]
 use crate::macos_installer_fs::GuardLock;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,7 +24,7 @@ impl Service {
 /// The future runner must map these fixed variants to /bin/launchctl without a
 /// shell, with a bounded output and deadline; it must not leave a child running.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Command { Domain, Disabled, Print(Service), Bootstrap(Service), Bootout(Service) }
+pub(crate) enum Command { Domain, Disabled, Print(Service), Enable(Service), Bootstrap(Service), Bootout(Service) }
 impl Command {
     /// Exact argv for /bin/launchctl. No string in this table comes from a UI,
     /// file, or peer process. A real runner must avoid invoking a shell.
@@ -33,6 +34,8 @@ impl Command {
             Self::Disabled => &["print-disabled", "system"],
             Self::Print(Service::Recovery) => &["print", "system/dev.prismroute.proxy-recovery"],
             Self::Print(Service::Bridge) => &["print", "system/dev.prismroute.proxy-bridge"],
+            Self::Enable(Service::Recovery) => &["enable", "system/dev.prismroute.proxy-recovery"],
+            Self::Enable(Service::Bridge) => &["enable", "system/dev.prismroute.proxy-bridge"],
             Self::Bootstrap(Service::Recovery) => &["bootstrap", "system", "/Library/LaunchDaemons/dev.prismroute.proxy-recovery.plist"],
             Self::Bootstrap(Service::Bridge) => &["bootstrap", "system", "/Library/LaunchDaemons/dev.prismroute.proxy-bridge.plist"],
             Self::Bootout(Service::Recovery) => &["bootout", "system/dev.prismroute.proxy-recovery"],
@@ -72,6 +75,10 @@ fn enabled(runner: &mut impl Runner, service: Service) -> Result<bool, &'static 
     if values.is_empty() && response.stdout.contains(service.label()) { return Err("unrecognized disabled service override"); }
     match values.first().copied() { None | Some("enabled") => Ok(true), Some("disabled") => Ok(false), _ => Err("unknown disabled service override") }
 }
+fn unquote(value: &str) -> &str {
+    value.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(value)
+}
+
 fn matches_service(service: Service, text: &str) -> bool {
     if text.len() > 1024 * 1024 { return false; }
     let lines: Vec<_> = text.lines().map(str::trim).collect();
@@ -81,10 +88,13 @@ fn matches_service(service: Service, text: &str) -> bool {
         || !unique("arguments = {") { return false; }
     let Some(index) = lines.iter().position(|line| *line == "arguments = {") else { return false };
     match service {
-        Service::Recovery => unique("run interval = 15 seconds")
-            && lines.get(index + 1..index + 4) == Some(&[service.program(), "--recover-only", "}"][..]),
+        Service::Recovery => (unique("run interval = 15 seconds") || unique("start interval = 15 seconds"))
+            && lines.get(index + 1).is_some_and(|a| unquote(a) == service.program())
+            && lines.get(index + 2).is_some_and(|a| unquote(a) == "--recover-only")
+            && lines.get(index + 3) == Some(&"}"),
         Service::Bridge => {
-            if lines.get(index + 1..index + 3) != Some(&[service.program(), "}"][..]) { return false; }
+            if !lines.get(index + 1).is_some_and(|a| unquote(a) == service.program())
+                || lines.get(index + 2) != Some(&"}") { return false; }
             if unique("mach services = {") {
                 let Some(start) = lines.iter().position(|line| *line == "mach services = {") else { return false };
                 let Some(relative_end) = lines[start + 1..].iter().position(|line| *line == "}") else { return false };
@@ -97,31 +107,59 @@ fn matches_service(service: Service, text: &str) -> bool {
                     })
                 }).count() == 1;
             }
-            // macOS 27 calls this section "endpoints" and nests each Mach
-            // service as a dictionary. Require the exact managed endpoint and
-            // a structurally complete section, not merely a label substring.
+            // macOS 14/15 prints `endpoints = { 0x... M D dev.prismroute.proxy-bridge }` (flat tabular)
+            // and macOS 26/27 nests each Mach service as a dictionary (`"dev.prismroute.proxy-bridge" = { ... managed = 1 ... }`).
+            // Require a structurally closed section with exactly one managed entry for our exact label.
             if !unique("endpoints = {") { return false; }
             let start = lines.iter().position(|line| *line == "endpoints = {").unwrap();
-            let target = format!("\"{}\" = {{", service.label());
-            let (mut depth, mut matches, mut managed, mut selected, mut closed) = (1usize, 0usize, false, false, false);
+            let target_quoted = format!("\"{}\" = {{", service.label());
+            let target_bare = format!("{} = {{", service.label());
+            let (mut depth, mut dict_matches, mut dict_managed, mut selected, mut flat_matches, mut closed) = (1usize, 0usize, false, false, 0usize, false);
             for line in &lines[start + 1..] {
-                if line.ends_with("= {") {
-                    if depth == 1 { selected = *line == target; if selected { matches += 1; } }
+                if line.ends_with('{') {
+                    if depth == 1 {
+                        selected = *line == target_quoted || *line == target_bare;
+                        if selected { dict_matches += 1; }
+                    }
                     depth += 1;
                 } else if *line == "}" {
                     if depth == 0 { return false; }
                     depth -= 1;
                     if depth == 1 { selected = false; }
                     if depth == 0 { closed = true; break; }
-                } else if depth == 2 && selected && *line == "managed = 1" { managed = true; }
+                } else if depth == 2 && selected && *line == "managed = 1" {
+                    dict_managed = true;
+                } else if depth == 1 {
+                    let cols: Vec<_> = line.split_whitespace().collect();
+                    if cols.len() >= 4
+                        && cols[0].starts_with("0x")
+                        && cols[0].len() > 2
+                        && cols[0][2..].bytes().all(|b| b.is_ascii_hexdigit())
+                        && cols[1] == "M"
+                        && *cols.last().unwrap() == service.label()
+                    {
+                        flat_matches += 1;
+                    }
+                }
             }
-            closed && matches == 1 && managed
+            closed && ((dict_matches == 1 && dict_managed && flat_matches == 0) || (flat_matches == 1 && dict_matches == 0))
         }
     }
 }
 fn verify(runner: &mut impl Runner, service: Service) -> Result<(), &'static str> {
     let response = output(runner, Command::Print(service))?;
-    if !response.success || !matches_service(service, &response.stdout) { return Err("loaded service does not match expected configuration"); }
+    if !response.success {
+        return Err(match service {
+            Service::Recovery => "loaded recovery service could not be inspected",
+            Service::Bridge => "loaded bridge service could not be inspected",
+        });
+    }
+    if !matches_service(service, &response.stdout) {
+        return Err(match service {
+            Service::Recovery => "loaded recovery service does not match expected configuration",
+            Service::Bridge => "loaded bridge service does not match expected configuration",
+        });
+    }
     Ok(())
 }
 fn remove_if_owned(runner: &mut impl Runner, service: Service) -> Result<(), &'static str> {
@@ -133,6 +171,39 @@ fn remove_if_owned(runner: &mut impl Runner, service: Service) -> Result<(), &'s
     // Never declare the files removable after such an uncertain command.
     output(runner, Command::Bootout(service))?;
     if !absent(runner, service)? { return Err("service removal could not be confirmed"); }
+    Ok(())
+}
+
+fn verify_existing_inner(runner: &mut impl Runner) -> Result<(), &'static str> {
+    for service in [Service::Recovery, Service::Bridge] {
+        // An absent (unloaded) service has no foreign configuration in launchd; it will be
+        // cleanly bootstrapped after files are updated. Any loaded service must still match.
+        if !absent(runner, service)? {
+            verify(runner, service)?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_enabled_inner(runner: &mut impl Runner) -> Result<(), &'static str> {
+    for service in [Service::Recovery, Service::Bridge] {
+        if !enabled(runner, service)? {
+            if !output(runner, Command::Enable(service))?.success || !enabled(runner, service)? {
+                return Err("installed service is disabled");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn stop_existing_inner(runner: &mut impl Runner) -> Result<(), &'static str> {
+    verify_existing_inner(runner)?;
+    remove_if_owned(runner, Service::Bridge)?;
+    remove_if_owned(runner, Service::Recovery)?;
+    if !matches!(absent(runner, Service::Bridge), Ok(true))
+        || !matches!(absent(runner, Service::Recovery), Ok(true)) {
+        return Err("cannot confirm services stopped");
+    }
     Ok(())
 }
 
@@ -185,7 +256,9 @@ fn register_inner(runner: &mut impl Runner) -> Result<Attempted, RegisterError> 
 /// No concrete runner exists yet. Registration is available only while the
 /// caller holds the same lock as the guard; files must remain present until
 /// rollback returns success and all runner children have exited.
+#[cfg(any(target_os = "macos", unix))]
 pub(crate) struct Controller<'a, R> { runner: R, _lock: &'a GuardLock }
+#[cfg(any(target_os = "macos", unix))]
 impl<'a, R: Runner> Controller<'a, R> {
     pub(crate) fn new(runner: R, lock: &'a GuardLock) -> Self { Self { runner, _lock: lock } }
     pub(crate) fn preflight(&mut self) -> Result<(), &'static str> {
@@ -201,20 +274,15 @@ impl<'a, R: Runner> Controller<'a, R> {
             && matches!(absent(&mut self.runner, Service::Recovery), Ok(true))
     }
     pub(crate) fn verify_existing(&mut self) -> Result<(), &'static str> {
-        for service in [Service::Recovery, Service::Bridge] {
-            if !enabled(&mut self.runner, service)? { return Err("installed service is disabled"); }
-            verify(&mut self.runner, service)?;
-        }
-        Ok(())
+        verify_existing_inner(&mut self.runner)
+    }
+    pub(crate) fn ensure_enabled(&mut self) -> Result<(), &'static str> {
+        ensure_enabled_inner(&mut self.runner)
     }
     /// Stop only the two verified services, in dependency order. An uncertain
     /// failure leaves the backup in place and must not lead to file replacement.
     pub(crate) fn stop_existing(&mut self) -> Result<(), &'static str> {
-        self.verify_existing()?;
-        remove_if_owned(&mut self.runner, Service::Bridge)?;
-        remove_if_owned(&mut self.runner, Service::Recovery)?;
-        if !self.files_safe_to_remove() { return Err("cannot confirm services stopped"); }
-        Ok(())
+        stop_existing_inner(&mut self.runner)
     }
     /// Restore originally registered services after their files are restored.
     pub(crate) fn start_existing(&mut self) -> Result<(), &'static str> {
@@ -270,6 +338,9 @@ mod tests {
                 Command::Print(service) => {
                     result.success = self.present(service);
                     result.stdout = if self.bad_service == Some(service) { Self::status(service).replace(service.program(), "/tmp/foreign") } else { Self::status(service) };
+                }
+                Command::Enable(_) => {
+                    self.disabled = false;
                 }
                 Command::Bootstrap(service) => {
                     self.set_present(service, true);
@@ -353,6 +424,43 @@ mod tests {
         assert!(!matches_service(Service::Bridge, &status.replace("managed = 1", "managed = 0")));
         assert!(!matches_service(Service::Bridge, &status.replace(Service::Bridge.label(), "dev.example.other")));
         assert!(!matches_service(Service::Bridge, &status.replace("active = 1\n managed = 1\n }\n }", "active = 1\n managed = 1")));
+    }
+    #[test]
+    fn recognizes_macos_14_15_flat_endpoints_and_start_interval() {
+        let original = Fake::status(Service::Bridge);
+        let old = format!(" mach services = {{\n \"{}\" => active\n }}", Service::Bridge.label());
+        let flat = format!(" endpoints = {{\n 0x1a2b3    M   D   {}\n }}", Service::Bridge.label());
+        let status = original.replace(&old, &flat);
+        assert!(matches_service(Service::Bridge, &status));
+        assert!(!matches_service(Service::Bridge, &status.replace(" M ", " U ")));
+        assert!(!matches_service(Service::Bridge, &status.replace(Service::Bridge.label(), "dev.example.other")));
+        let bare_dict = format!(" endpoints = {{\n {} = {{\n active = 0\n managed = 1\n }}\n }}", Service::Bridge.label());
+        assert!(matches_service(Service::Bridge, &original.replace(&old, &bare_dict)));
+        assert!(matches_service(Service::Recovery, &Fake::status(Service::Recovery).replace("run interval = 15 seconds", "start interval = 15 seconds")));
+    }
+    #[test]
+    fn upgrade_allows_absent_services_and_reenables_disabled_but_rejects_foreign() {
+        // Neither service loaded (e.g. after a crashed upgrade or bootout): upgrade must proceed.
+        let mut unloaded = Fake { recovery: false, bridge: false, disabled: true, ..Fake::default() };
+        verify_existing_inner(&mut unloaded).unwrap();
+        stop_existing_inner(&mut unloaded).unwrap();
+        ensure_enabled_inner(&mut unloaded).unwrap();
+        assert!(!unloaded.disabled);
+        register_inner(&mut unloaded).unwrap();
+        assert!(unloaded.recovery && unloaded.bridge);
+
+        // Only one service loaded: stop_existing unloads it cleanly.
+        let mut partial = Fake { recovery: false, bridge: true, ..Fake::default() };
+        stop_existing_inner(&mut partial).unwrap();
+        assert!(!partial.recovery && !partial.bridge);
+        assert!(partial.calls.contains(&Command::Bootout(Service::Bridge)));
+        assert!(!partial.calls.contains(&Command::Bootout(Service::Recovery)));
+
+        // A foreign service under our label must still fail closed.
+        let mut foreign = Fake { recovery: true, bridge: true, bad_service: Some(Service::Bridge), ..Fake::default() };
+        assert!(verify_existing_inner(&mut foreign).is_err());
+        assert!(stop_existing_inner(&mut foreign).is_err());
+        assert!(!foreign.calls.contains(&Command::Bootout(Service::Bridge)));
     }
     #[cfg(target_os = "macos")]
     #[test]

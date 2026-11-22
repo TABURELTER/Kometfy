@@ -548,6 +548,23 @@ pub fn summarize_error(text: &str) -> String {
     }
 }
 
+/// Why the core's controller did not come up in time, from its last lines: its own error if it logged one; that it
+/// was still downloading its rule lists if that is the last thing it did (a slow or blocked list server); otherwise
+/// that it did not become ready. A plain last line such as "Start initial provider …" read as the error before.
+pub fn not_ready(tail: &str, secs: u64) -> String {
+    let lines: Vec<&str> = tail.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if lines.is_empty() {
+        return format!("core did not become ready in {secs} s");
+    }
+    if lines.iter().any(|l| l.contains("level=error") || l.contains("level=fatal")) {
+        return summarize_error(tail);
+    }
+    if lines.last().is_some_and(|l| l.contains("initial provider")) {
+        return format!("the core was still downloading its rule lists after {secs} s");
+    }
+    format!("core did not become ready in {secs} s")
+}
+
 /// `v1.19.33`, `alpha-abc123`, ... from `mihomo -v`.
 pub fn version(bin: &Path) -> Option<String> {
     let mut cmd = Command::new(bin);
@@ -572,6 +589,17 @@ pub fn version(bin: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_core_that_is_not_ready_says_why() {
+        let loading = "time=\"x\" level=info msg=\"Use tcp concurrent\"
+time=\"x\" level=info msg=\"Start initial provider whitelist\"";
+        assert_eq!(not_ready(loading, 40), "the core was still downloading its rule lists after 40 s");
+        let failed = "time=\"x\" level=error msg=\"listen tcp: bind: address already in use\"";
+        assert_eq!(not_ready(failed, 40), "listen tcp: bind: address already in use");
+        assert_eq!(not_ready("time=\"x\" level=info msg=\"Use tcp concurrent\"", 40), "core did not become ready in 40 s");
+        assert_eq!(not_ready("", 40), "core did not become ready in 40 s");
+    }
     use super::*;
 
     #[test]

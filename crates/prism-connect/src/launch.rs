@@ -25,11 +25,11 @@ use crate::{
     util::CREATE_NO_WINDOW,
 };
 
-pub const TASK_NAME: &str = "PrismRoute";
+pub const TASK_NAME: &str = crate::channel::NOW.task;
 /// Passed by the task so a launch that came from it never delegates again (no loops).
 pub const VIA_TASK: &str = "--via-task";
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-const RUN_VALUE: &str = "PrismRoute";
+const RUN_VALUE: &str = crate::channel::NOW.task;
 
 fn exe() -> Result<PathBuf> {
     Ok(std::env::current_exe()?)
@@ -150,12 +150,13 @@ pub fn stash_args(dir: &Path, args: &[String]) {
     let _ = std::fs::write(dir.join("launch.args"), args.join("\n"));
 }
 
-/// Read and delete what `stash_args` left. Ignored when older than a minute (a stale leftover).
+/// Read and delete what `stash_args` left. Ignored when older than ten minutes (a stale leftover): on a cold start
+/// of Windows the task can start a minute or more after the Run entry, and a lost `--hidden` showed the window.
 pub fn take_args(dir: &Path) -> Vec<String> {
     let f = dir.join("launch.args");
     let fresh = std::fs::metadata(&f)
         .and_then(|m| m.modified())
-        .is_ok_and(|t| t.elapsed().is_ok_and(|e| e < Duration::from_secs(60)));
+        .is_ok_and(|t| t.elapsed().is_ok_and(|e| e < Duration::from_secs(600)));
     let text = if fresh { std::fs::read_to_string(&f).unwrap_or_default() } else { String::new() };
     let _ = std::fs::remove_file(&f);
     text.lines().map(str::trim).filter(|l| l.starts_with("--")).map(String::from).collect()

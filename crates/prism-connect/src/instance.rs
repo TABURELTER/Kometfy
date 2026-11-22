@@ -5,13 +5,17 @@ mod platform {
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE},
-    System::Threading::CreateMutexW,
-    UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW},
+    Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, WAIT_OBJECT_0},
+    System::Threading::{CreateEventW, CreateMutexW, OpenEventW, SetEvent, WaitForSingleObject, EVENT_MODIFY_STATE, INFINITE},
+    UI::WindowsAndMessaging::{AllowSetForegroundWindow, FindWindowW, SetForegroundWindow, ShowWindow, ASFW_ANY, SW_RESTORE, SW_SHOW},
 };
 
-const MUTEX_NAME: &str = "Local\\PrismRouteConnect.SingleInstance";
-const WINDOW_TITLE: &str = "Kometfy";
+use crate::channel::NOW;
+
+const MUTEX_NAME: &str = NOW.mutex;
+const WINDOW_TITLE: &str = NOW.window_title;
+/// Set by another launch: show the window. A start with Windows makes no window, so there may be none to find by title.
+const SHOW_EVENT: &str = NOW.show_event;
 
 /// Holds the mutex until the process exits. Never closed on purpose.
 pub struct Guard(#[allow(dead_code)] HANDLE);
@@ -28,7 +32,7 @@ fn wide(s: &str) -> Vec<u16> {
 pub fn acquire(wait: Duration) -> Option<Guard> {
     #[cfg(debug_assertions)]
     let mutex = if std::env::var_os("PRISM_UI_PREVIEW_DIR").is_some() {
-        "Local\\PrismRouteConnect.UIPreview"
+        NOW.preview_mutex
     } else { MUTEX_NAME };
     #[cfg(not(debug_assertions))]
     let mutex = MUTEX_NAME;
@@ -56,8 +60,34 @@ impl Guard {
     }
 }
 
-/// Best effort: show and focus the window of the instance that is already running.
+/// In the running instance: call `show` whenever another launch asks for the window.
+pub fn on_show_request(show: impl Fn() + Send + 'static) {
+    let name = wide(SHOW_EVENT);
+    // auto-reset: one wake per request
+    let h = unsafe { CreateEventW(std::ptr::null(), 0, 0, name.as_ptr()) };
+    if h.is_null() {
+        return;
+    }
+    let h = h as usize; // a kernel object id, valid for the whole process
+    std::thread::spawn(move || {
+        while unsafe { WaitForSingleObject(h as HANDLE, INFINITE) } == WAIT_OBJECT_0 {
+            show();
+        }
+    });
+}
+
+/// Best effort: show and focus the window of the instance that is already running (it makes one if it has none).
 pub fn focus_existing() {
+    let name = wide(SHOW_EVENT);
+    unsafe {
+        let h = OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr());
+        if !h.is_null() {
+            // this launch has the user's click: let the running instance bring its window to the front
+            AllowSetForegroundWindow(ASFW_ANY);
+            SetEvent(h);
+            CloseHandle(h);
+        }
+    }
     let title = wide(WINDOW_TITLE);
     unsafe {
         let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
@@ -78,7 +108,7 @@ mod platform {
 
     pub fn acquire(wait: Duration) -> Option<Guard> {
         let dir = std::env::var_os("HOME").map(std::path::PathBuf::from)?
-            .join("Library/Application Support/dev.prismroute.console");
+            .join("Library/Application Support").join(crate::channel::NOW.data_dir);
         fs::create_dir_all(&dir).ok()?;
         let file = OpenOptions::new().read(true).write(true).create(true).open(dir.join("instance.lock")).ok()?;
         let start = Instant::now();
@@ -101,8 +131,11 @@ mod platform {
 
     pub fn focus_existing() {
         let _ = std::process::Command::new("/usr/bin/open")
-            .args(["-b", "dev.prismroute.console"]).spawn();
+            .args(["-b", crate::channel::NOW.bundle_id]).spawn();
     }
+
+    /// macOS brings the running app forward itself (`open -b`); its window is made at the start.
+    pub fn on_show_request(_show: impl Fn() + Send + 'static) {}
 }
 
 /// A phone starts one copy of an app by itself: nothing to guard.
@@ -121,6 +154,8 @@ mod platform {
     }
 
     pub fn focus_existing() {}
+
+    pub fn on_show_request(_show: impl Fn() + Send + 'static) {}
 }
 
 pub use platform::*;
