@@ -780,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(any(windows, target_os = "linux", target_os = "android"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "android", target_os = "macos"))]
     fn a_busy_process_reads_as_a_share_of_one_core_and_shows_now() {
         let dir = temp("cpu");
         let m = Metrics::open(file_in(&dir), true);
@@ -935,7 +935,7 @@ mod tests {
     #[test]
     fn this_process_can_be_measured() {
         let me = sample_process(std::process::id());
-        #[cfg(any(windows, target_os = "linux", target_os = "android"))]
+        #[cfg(any(windows, target_os = "linux", target_os = "android", target_os = "macos"))]
         {
             let me = me.expect("own process");
             assert!(me.working_set_mb > 1.0 && me.cpu_secs >= 0.0);
@@ -944,7 +944,7 @@ mod tests {
             s.take(&m, "app", &[std::process::id()]);
             assert!(m.summary(1).stats.contains_key("working_set_mb.app"));
         }
-        #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
+        #[cfg(not(any(windows, target_os = "linux", target_os = "android", target_os = "macos")))]
         assert!(me.is_none());
     }
 }
