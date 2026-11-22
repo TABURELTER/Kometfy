@@ -194,7 +194,7 @@ impl GuardLock {
             return Err(io::Error::last_os_error());
         }
         if current.st_dev as u64 != meta.dev() || current.st_ino as u64 != meta.ino()
-            || current.st_mode & libc::S_IFMT != libc::S_IFREG || current.st_nlink != 1 {
+            || (current.st_mode as libc::mode_t) & libc::S_IFMT != libc::S_IFREG || current.st_nlink != 1 {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, "guard lock path changed"));
         }
         let mut backup: libc::stat = unsafe { std::mem::zeroed() };
@@ -215,7 +215,7 @@ fn unlink_matching(entry: &Published) -> io::Result<()> {
         let error = io::Error::last_os_error();
         return if error.kind() == io::ErrorKind::NotFound { Ok(()) } else { Err(error) };
     }
-    if stat.st_dev as u64 != entry.device || stat.st_ino as u64 != entry.inode || stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+    if stat.st_dev as u64 != entry.device || stat.st_ino as u64 != entry.inode || (stat.st_mode as libc::mode_t) & libc::S_IFMT != libc::S_IFREG {
         return Err(io::Error::new(io::ErrorKind::AlreadyExists, "installation file changed; retained for inspection"));
     }
     if unsafe { libc::unlinkat(entry.dir.as_raw_fd(), entry.name.as_ptr(), 0) } != 0 { return Err(io::Error::last_os_error()); }
