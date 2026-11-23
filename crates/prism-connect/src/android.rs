@@ -31,6 +31,11 @@ pub trait AndroidVpn: Send + Sync {
     fn establish(&self, params: VpnParams) -> Fut<i32>;
     /// Close the tunnel and take the notification down.
     fn stop(&self) -> Fut<()>;
+    /// Whether the Android `VpnService` still holds a live TUN descriptor (`Some(false)` after OS
+    /// `onRevoke()` or tunnel teardown; `None` if unknown/unsupported).
+    fn is_active(&self) -> Fut<Option<bool>> {
+        Box::pin(async { Ok(None) })
+    }
     /// The link the device is on now (`wifi`, `cellular`, `ethernet`, `other`, "" unknown) and, on a mobile link,
     /// the SIM's operator name ("MTS RUS"); for the statistics and the remote tests the user agreed to.
     fn network(&self) -> Fut<(String, String)> {

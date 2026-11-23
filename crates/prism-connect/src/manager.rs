@@ -1796,6 +1796,8 @@ impl Manager {
                 if me.dpi_alive.load(SeqCst) && me.zapret.pid().is_none() && me.zapret_find.lock().unwrap().is_none() {
                     me.revive_dpi().await;
                 }
+                #[cfg(target_os = "android")]
+                me.poll_android_vpn_integrity().await;
                 me.sample_resources();
                 #[cfg(target_os = "macos")]
                 {
@@ -1807,6 +1809,32 @@ impl Manager {
                 }
             }
         }));
+    }
+
+    /// Android can revoke our VpnService (another VPN took over, user disabled VPN in system settings,
+    /// or Android 15-17 dropped the tunnel) without killing mihomo. Reconcile Rust state with the live
+    /// Android tunnel so the UI never shows Connected when the tunnel is gone, or leaves an orphan tunnel.
+    #[cfg(target_os = "android")]
+    async fn poll_android_vpn_integrity(&self) {
+        let Ok(_operation) = self.op.try_lock() else { return };
+        let vpn = self.android.lock().unwrap().clone();
+        let Some(vpn) = vpn else { return };
+        let Ok(Some(active)) = vpn.is_active().await else { return };
+        let tun = self.tun_on.load(SeqCst);
+        if tun && !active {
+            warn!("Android VPN tunnel was closed by the system; stopping core to keep state in sync");
+            self.push_log("warning", "VPN tunnel was closed by Android");
+            self.expected_running.store(false, SeqCst);
+            self.abort_streams();
+            self.core.stop();
+            self.tun_on.store(false, SeqCst);
+            self.settings.write().unwrap().connected = false;
+            let _ = self.save_settings();
+            self.emit_state();
+        } else if !tun && !self.running() && active {
+            warn!("Android VPN tunnel remained active without a running core; closing orphan tunnel");
+            let _ = vpn.stop().await;
+        }
     }
 
     /// A user or macOS can change network locations, services, bypass rules or
